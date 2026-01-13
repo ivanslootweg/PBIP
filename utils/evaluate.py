@@ -6,6 +6,13 @@ import torch.nn.functional as F
 
 class ConfusionMatrixAllClass(object):
     def __init__(self, num_classes):
+        """Initialize confusion matrix.
+        
+        Args:
+            num_classes: Total number of classes INCLUDING background.
+                        For example, if you have 2 semantic classes (benign, tumor),
+                        pass num_classes=3 (benign, tumor, background).
+        """
         self.num_classes = num_classes
         self.mat1 = None
         self.mat2 = None

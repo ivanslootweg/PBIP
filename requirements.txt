@@ -33,6 +33,7 @@ MedCLIP==0.0.3
 
 # Data Processing
 pandas==2.2.1
+openslide-python==1.2.0
 
 # Additional Dependencies
 PyYAML==6.0.1

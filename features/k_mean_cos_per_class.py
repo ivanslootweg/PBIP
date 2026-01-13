@@ -3,8 +3,9 @@ import pickle as pkl
 import numpy as np
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
-import matplotlib.pyplot as plt
-from PIL import Image
+from omegaconf import OmegaConf
+import argparse
+import glob
 
 class CosineSimilarityKMeans:
     def __init__(self, n_clusters, max_iter=100, random_state=None):
@@ -35,15 +36,36 @@ class CosineSimilarityKMeans:
                 
         return new_labels, similarities, torch.from_numpy(self.cluster_centers_)
 
-def cluster_features_per_class(k_list):
-    with open("./features/image_features/bcss_features_pro.pkl", 'rb') as f:
+def cluster_features_per_class(cfg):
+    save_dir = cfg.features.save_dir
+    base_medclip_name = cfg.features.medclip_features_pkl.replace('.pkl', '')
+    
+    # Try to find UID-based medclip features file
+    uid_pattern = os.path.join(save_dir, f"{base_medclip_name}_*.pkl")
+    uid_files = glob.glob(uid_pattern)
+    
+    uid = None
+    if uid_files:
+        input_pkl = uid_files[0]
+        # Extract UID from filename
+        filename = os.path.basename(input_pkl)
+        uid = filename.replace(f"{base_medclip_name}_", "").replace(".pkl", "")
+        print(f"Found UID-based MedCLIP features: {filename}")
+    else:
+        # Fall back to legacy filename
+        input_pkl = os.path.join(save_dir, cfg.features.medclip_features_pkl)
+    
+    with open(input_pkl, 'rb') as f:
         features_dict = pkl.load(f)
+
+    k_list = list(cfg.features.k_list)
+    class_order = list(getattr(cfg.dataset, 'class_order', ['TUM', 'STR', 'LYM', 'NEC']))
     
-    if len(k_list) != 4:
-        raise ValueError("k_list must contain 4 values for TUM, STR, LYM, and NEC respectively")
-    
+    if len(k_list) != len(class_order):
+        raise ValueError(f"features.k_list must have {len(class_order)} values (one per parent class in class_order), got {len(k_list)}")
+
     all_centers = []
-    class_order = ['TUM', 'STR', 'LYM', 'NEC']
+    class_order = list(getattr(cfg.dataset, 'class_order', ['TUM', 'STR', 'LYM', 'NEC']))
     
     for class_name, k in zip(class_order, k_list):
         print(f"\n{'='*20} Class: {class_name} (k={k}) {'='*20}")
@@ -87,9 +109,15 @@ def cluster_features_per_class(k_list):
         'cumsum_k': np.cumsum([0] + k_list) 
     }
     
-    save_dir = "./features/image_features"
+    save_dir = cfg.features.save_dir
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"bcss_label_fea_pro_{k_list[0]}{k_list[1]}{k_list[2]}{k_list[3]}.pkl")
+    
+    # Use UID in label features filename if available
+    base_label_name = cfg.features.label_feature_pkl.replace('.pkl', '')
+    if uid:
+        save_path = os.path.join(save_dir, f"{base_label_name}_{uid}.pkl")
+    else:
+        save_path = os.path.join(save_dir, cfg.features.label_feature_pkl)
     
     with open(save_path, 'wb') as f:
         pkl.dump(save_info, f)
@@ -105,10 +133,9 @@ def cluster_features_per_class(k_list):
         print(f"{class_name}: {start_idx} to {end_idx}")
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--k_list', type=int, nargs=4, default=[3,3,3,3],
-                      help='Number of clusters for each class [TUM, STR, LYM, NEC]')
+    parser.add_argument('--config', type=str, required=True, help='Path to YAML config')
     args = parser.parse_args()
-    
-    cluster_features_per_class(k_list=args.k_list) 
+
+    cfg = OmegaConf.load(args.config)
+    cluster_features_per_class(cfg)

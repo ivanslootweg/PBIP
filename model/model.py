@@ -1,4 +1,5 @@
 import pickle as pkl
+import os
 from functools import partial
 
 import torch
@@ -39,25 +40,32 @@ class AdaptiveLayer(nn.Module):
 class ClsNetwork(nn.Module):
     def __init__(self,
                  backbone='mit_b1',
-                 cls_num_classes=4,
+                 num_classes=4,
                  stride=[4, 2, 2, 1],
                  pretrained=True,
                  n_ratio=0.5,
                  l_fea_path=None):
         super().__init__()
-        self.cls_num_classes = cls_num_classes
+        self.num_classes = num_classes
         self.stride = stride
 
+        # Use custom MixTransformer from segform module
         self.encoder = getattr(mix_transformer, backbone)(stride=self.stride)
         self.in_channels = self.encoder.embed_dims
 
-        # initialize encoder
+        # Initialize encoder with pretrained weights if available
         if pretrained:
-            state_dict = torch.load('./pretrained/'+backbone+'.pth', map_location="cpu")
-            state_dict.pop('head.weight')
-            state_dict.pop('head.bias')
-            state_dict = {k: v for k, v in state_dict.items() if k in self.encoder.state_dict().keys()}
-            self.encoder.load_state_dict(state_dict, strict=False)
+            pretrained_path = f'./pretrained/{backbone}.pth'
+            if os.path.exists(pretrained_path):
+                # weights_only=False needed for PyTorch 2.6+ compatibility
+                state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+                state_dict.pop('head.weight', None)
+                state_dict.pop('head.bias', None)
+                state_dict = {k: v for k, v in state_dict.items() if k in self.encoder.state_dict().keys()}
+                self.encoder.load_state_dict(state_dict, strict=False)
+                print(f"Loaded pretrained weights from {pretrained_path}")
+            else:
+                print(f"Warning: Pretrained weights not found at {pretrained_path}, using random initialization")
 
         self.pooling = F.adaptive_avg_pool2d
 
@@ -67,7 +75,40 @@ class ClsNetwork(nn.Module):
         self.l_fc3 = AdaptiveLayer(512, n_ratio, self.in_channels[2])
         self.l_fc4 = AdaptiveLayer(512, n_ratio, self.in_channels[3])
 
-        with open("./features/image_features/{}.pkl".format(l_fea_path), "rb") as lf:
+        # Resolve label feature path: allow full .pkl path or basename
+        # Supports both legacy and UID-based filenames
+        resolved_path = None
+        if isinstance(l_fea_path, str):
+            # If it's an existing file path
+            if os.path.isfile(l_fea_path):
+                resolved_path = l_fea_path
+            else:
+                # Try as full path string ending with .pkl
+                if l_fea_path.endswith('.pkl') and os.path.isfile(l_fea_path):
+                    resolved_path = l_fea_path
+                else:
+                    # Try to find UID-based version
+                    import glob
+                    base_name = os.path.basename(l_fea_path)
+                    if base_name.endswith('.pkl'):
+                        base_name = base_name[:-4]
+                    
+                    # Search for UID-based file in same directory
+                    dir_path = os.path.dirname(l_fea_path) or "./features/image_features"
+                    uid_pattern = os.path.join(dir_path, f"{base_name}_*.pkl")
+                    uid_files = glob.glob(uid_pattern)
+                    
+                    if uid_files:
+                        resolved_path = uid_files[0]
+                    else:
+                        # Fallback to legacy location by basename
+                        candidate = os.path.join("./features/image_features", f"{base_name}.pkl")
+                        if os.path.isfile(candidate):
+                            resolved_path = candidate
+        if resolved_path is None:
+            raise FileNotFoundError(f"Label feature .pkl not found. Provided l_fea_path='{l_fea_path}'. Tried UID-based, direct path, and ./features/image_features/{{name}}.pkl")
+
+        with open(resolved_path, "rb") as lf:
             info = pkl.load(lf)
             self.l_fea = info['features'].cpu()
             self.k_list = info['k_list']
@@ -94,7 +135,12 @@ class ClsNetwork(nn.Module):
         return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
 
     def forward(self, x):
-        _x, _attns = self.encoder(x) 
+        # MixTransformer returns (feature_maps, attentions)
+        _x, _attns = self.encoder(x)
+        
+        # Ensure we have exactly 4 feature maps
+        if len(_x) != 4:
+            raise ValueError(f"Expected 4 feature maps from encoder, got {len(_x)}")
 
         logit_scale1 = self.logit_scale1
         logit_scale2 = self.logit_scale2

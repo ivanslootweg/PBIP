@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from .evaluate import ConfusionMatrixAllClass
 from .hierarchical_utils import merge_to_parent_predictions, merge_subclass_cams_to_parent
 from .pyutils import AverageMeter
+from .common import merge_multiscale_predictions, merge_multiscale_cams, compute_multiscale_loss, get_color_palette
 
 
 def get_seg_label(cams, inputs, label):
@@ -46,7 +47,7 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
     """Validation function with test-time augmentation"""
     model.eval()
     avg_meter = AverageMeter()
-    fuse234_matrix = ConfusionMatrixAllClass(num_classes=cfg.dataset.cls_num_classes + 1)
+    fuse234_matrix = ConfusionMatrixAllClass(num_classes=cfg.dataset.num_classes + 1)
     
     # Test-time augmentation setup
     tta_transform = tta.Compose([
@@ -64,16 +65,14 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
 
             cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs, )
 
-            cls1 = merge_to_parent_predictions(cls1, k_list, method=cfg.train.merge_test)
-            cls2 = merge_to_parent_predictions(cls2, k_list, method=cfg.train.merge_test)
-            cls3 = merge_to_parent_predictions(cls3, k_list, method=cfg.train.merge_test)
-            cls4 = merge_to_parent_predictions(cls4, k_list, method=cfg.train.merge_test)
+            # Merge subclass predictions to parent class predictions
+            cls1, cls2, cls3, cls4 = merge_multiscale_predictions(
+                [cls1, cls2, cls3, cls4], k_list, method=cfg.train.merge_test)
 
-            cls_loss1 = cls_loss_func(cls1, cls_label)
-            cls_loss2 = cls_loss_func(cls2, cls_label)
-            cls_loss3 = cls_loss_func(cls3, cls_label)
-            cls_loss4 = cls_loss_func(cls4, cls_label)
-            cls_loss = cfg.train.l1 * cls_loss1 + cfg.train.l2 * cls_loss2 + cfg.train.l3 * cls_loss3 + cfg.train.l4 * cls_loss4
+            # Compute multi-scale weighted loss
+            weights = (cfg.train.scale1_weight, cfg.train.scale2_weight,
+                      cfg.train.scale3_weight, cfg.train.scale4_weight)
+            cls_loss = compute_multiscale_loss([cls1, cls2, cls3, cls4], cls_label, cls_loss_func, weights)
 
             cls4 = (torch.sigmoid(cls4) > 0.5).float()
             all_cls_acc4 = (cls4 == cls_label).all(dim=1).float().sum() / cls4.shape[0] * 100
@@ -89,15 +88,11 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
                 augmented_tensor = tta_trans.augment_image(inputs)
                 cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(augmented_tensor)
 
-                cam1 = merge_subclass_cams_to_parent(cam1, k_list, method=cfg.train.merge_test)
-                cam2 = merge_subclass_cams_to_parent(cam2, k_list, method=cfg.train.merge_test)
-                cam3 = merge_subclass_cams_to_parent(cam3, k_list, method=cfg.train.merge_test)
-                cam4 = merge_subclass_cams_to_parent(cam4, k_list, method=cfg.train.merge_test)
-
-                cls1 = merge_to_parent_predictions(cls1, k_list, method=cfg.train.merge_test)
-                cls2 = merge_to_parent_predictions(cls2, k_list, method=cfg.train.merge_test)
-                cls3 = merge_to_parent_predictions(cls3, k_list, method=cfg.train.merge_test)
-                cls4 = merge_to_parent_predictions(cls4, k_list, method=cfg.train.merge_test)
+                # Merge subclass CAMs and predictions to parent classes
+                cam1, cam2, cam3, cam4 = merge_multiscale_cams(
+                    [cam1, cam2, cam3, cam4], k_list, method=cfg.train.merge_test)
+                cls1, cls2, cls3, cls4 = merge_multiscale_predictions(
+                    [cls1, cls2, cls3, cls4], k_list, method=cfg.train.merge_test)
 
                 cam1 = get_seg_label(cam1, augmented_tensor, cls_label).cuda()
                 cam1 = tta_trans.deaugment_mask(cam1).unsqueeze(dim=0)
@@ -146,10 +141,9 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
 
             cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs, )
 
-            cam1 = merge_subclass_cams_to_parent(cam1, k_list, method=cfg.train.merge_test)
-            cam2 = merge_subclass_cams_to_parent(cam2, k_list, method=cfg.train.merge_test)
-            cam3 = merge_subclass_cams_to_parent(cam3, k_list, method=cfg.train.merge_test)
-            cam4 = merge_subclass_cams_to_parent(cam4, k_list, method=cfg.train.merge_test)
+            # Merge subclass CAMs to parent class CAMs
+            cam1, cam2, cam3, cam4 = merge_multiscale_cams(
+                [cam1, cam2, cam3, cam4], k_list, method=cfg.train.merge_test)
 
             cam1 = get_seg_label(cam1, inputs, cls_label).cuda()
             cam2 = get_seg_label(cam2, inputs, cls_label).cuda()
@@ -159,19 +153,13 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             fuse234 = 0.3 * cam2 + 0.3 * cam3 + 0.4 * cam4
             output_fuse234 = torch.argmax(fuse234, dim=1).long()
 
-
-            PALETTE = [
-             [255, 0, 0] ,   
-             [0, 255, 0],     
-             [0,0,255],  
-             [153, 0, 255],   
-             [255, 255, 255],
-             [0, 0, 0],]     
+            # Generate palette dynamically based on num_classes
+            PALETTE = get_color_palette(cfg.dataset.num_classes, include_background=True)
 
             for i in range(len(output_fuse234)):
                 pred_mask = Image.fromarray(output_fuse234[i].cpu().clone().squeeze().numpy().astype(np.uint8)).convert('P')
                 flat_palette = [val for sublist in PALETTE for val in sublist]
                 pred_mask.putpalette(flat_palette)
-                pred_mask.save(os.path.join(cfg.work_dir.pred_dir, name[i] + ".png"))
+                pred_mask.save(os.path.join(cfg.output_dirs.pred_dir, name[i] + ".png"))
     model.train()
     return 

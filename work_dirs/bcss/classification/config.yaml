@@ -12,7 +12,7 @@ dataset:
   name: bcss
   train_root: ./data/BCSS-WSSS/train
   val_root: ./data/BCSS-WSSS/
-  cls_num_classes: 4
+  num_classes: 4
   input_size:
   - 224
   - 224

@@ -1,0 +1,92 @@
+model:
+  backbone:
+    config: mit_b1
+    stride:
+    - 4
+    - 2
+    - 2
+    - 1
+  # You can set either a basename (legacy) or a full .pkl path.
+  # Recommended: point to the full path of the generated label feature .pkl
+  label_feature_path: ${features.save_dir}/${features.label_feature_pkl}
+  n_ratio: 0.5
+  # Patch encoder for prototype feature extraction
+  # Options: medclip (default), virchow2, dinov3
+  # - medclip: Medical foundation model (512-dim features)
+  # - virchow2: Pathology-specific ViT by PAIGE-AI (1280-dim features)
+  # - dinov3: Self-supervised ViT by Meta (1024-dim features)
+  patch_encoder: medclip
+
+# Work directory for all outputs
+work_dir: /data/pathology/projects/ivan/WSS/PBIP
+
+dataset:
+  name: custom_wsi
+  # Optional: order of parent classes used for prototypes
+  class_order: [benign, tumor]
+  # Paths to data directories
+  wsi_dir: /data/pa_cpgarchive/archives/skin/internal/images/derived/packed_p2/packed
+  coordinates_dir: /data/pa_cpgarchive/archives/skin/internal/images/derived/features_virchow_p2_f3/coordinates
+  split_csv: "/data/pathology/projects/ivan/DeepDerma/documents/classifier_splits/mohs_based_on_2024_test/splits_0.csv"
+  labels_csv: /data/pathology/projects/ivan/WSS/labels_dummy.csv
+  # gt_dir: /data/pathology/projects/ivan/DeepDerma/MOHS_READER/bcc_annotations/AI_bcc_tumormaps # binary labels per pixel. 0 = no tumor. 1 =  tumor
+  gt_dir : /data/pathology/projects/ivan/WSS/gt_annotations
+  # Dataset parameters
+  num_classes: 2
+  patch_size: 224
+  max_patches: null  # Use all patches (null) or limit to N patches per WSI
+  coordinates_suffix: .npy  # or .txt for text-based coordinates
+  mask_suffix: .tif  # file extension for ground truth masks
+  use_openslide: true
+  # Input size (used by model)
+  input_size:
+    - 224
+    - 224
+
+features:
+  # Folder with prototype exemplar images arranged by class, e.g.,
+  # proto_image_dir/benign/*.png, proto_image_dir/tumor/*.png, ...
+  proto_image_dir: ${work_dir}/prototypes
+  # Where to save MedCLIP image features and final label feature .pkl
+  save_dir: ${work_dir}/image_features
+  # Intermediate MedCLIP features filename (per-exemplar features)
+  medclip_features_pkl: medclip_exemplars.pkl
+  # Final label feature filename produced by k-means clustering
+  label_feature_pkl: label_fea_pro.pkl
+  # Number of subclasses per parent class (length must equal class_order length)
+  k_list: [3, 3]
+
+output_dirs:
+  ckpt_dir:  ${work_dir}/checkpoints
+  pred_dir:  ${work_dir}/predictions
+  train_log_dir:  ${work_dir}/training_logs
+
+train:
+  samples_per_gpu: 10  # Batch size
+  epoch: 10  # Paper uses 10 epochs for Stage 1 (Section 4.1)
+  pretrained: true  # ImageNet pretrained backbone
+  # Multi-scale classification loss weights from paper (Section 3.2, Equation 3)
+  scale1_weight: 0.0   # Scale 1 (1/4 resolution, stride 4) - not used
+  scale2_weight: 0.1   # Scale 2 (1/8 resolution, stride 8) - minor contribution
+  scale3_weight: 1.0   # Scale 3 (1/16 resolution, stride 16) - main supervision
+  scale4_weight: 1.0   # Scale 4 (1/32 resolution, stride 32) - main supervision
+  contrastive_weight: 0.5   # Contrastive loss weight β (Section 4.1: β = 0.5)
+  # Additional training hyperparameters from paper
+  lambda_cam: 0.01      # CAM regularization weight (Section 3.2)
+  temperature: 1.0      # InfoNCE temperature τ (Section 4.1: temperature = 1)
+  mask_adapter_alpha: 0.15  # Adaptive thresholding δ (Section 4.1: δ = 0.15)
+  merge_train: mean
+  merge_test: max
+
+optimizer:
+  type: AdamW
+  learning_rate: 0.00001  # 1e-5 from paper Section 4.1
+  betas:
+  - 0.9
+  - 0.999
+  weight_decay: 0.003  # 0.003 from paper Section 4.1
+
+scheduler:
+  warmup_iter: 0
+  warmup_ratio: 1.0e-06
+  power: 1.0
