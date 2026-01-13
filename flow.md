@@ -1,13 +1,5 @@
-## Stage 0: Prototype Coordinate Extraction
-
-```mermaid
-    graph TB
-        subgraph Input["📥 INPUT: Configuration & Data Files"]
-            A1["YAML Config"]
-            A2["Split CSV<br/>train/val/test"]
-            A3["Labels CSV<br/>image → class"]
-            A4["WSI Directory<br/>.tif files"]
-            A5["Coordinates Dir<br/>.npy files"]
+# Deprecated
+See docs/DATA_FLOW.md for current flow diagrams.
         end
 
         subgraph Load["Load & Parse"]
