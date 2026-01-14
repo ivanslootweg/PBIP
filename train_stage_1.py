@@ -141,33 +141,55 @@ def extract_and_cache_features(dataset, encoder, cfg, encoder_name, device):
             patches = []
             patch_coords = []
             
+            # Open WSI once for all patches (major speedup)
+            if use_openslide:
+                try:
+                    from utils.common import _openslide
+                    slide = _openslide.OpenSlide(wsi_path)
+                    half = patch_size // 2
+                except Exception as e:
+                    print(f"Failed to open WSI {filename}: {e}")
+                    continue
+            else:
+                # Load entire WSI once for numpy-based extraction
+                try:
+                    wsi = cv.imread(wsi_path)
+                    if wsi is None:
+                        from skimage import io
+                        wsi = io.imread(wsi_path)
+                    if len(wsi.shape) == 2:
+                        wsi = cv.cvtColor(wsi, cv.COLOR_GRAY2RGB)
+                    elif wsi.shape[2] == 4:
+                        wsi = cv.cvtColor(wsi, cv.COLOR_RGBA2RGB)
+                except Exception as e:
+                    print(f"Failed to load WSI {filename}: {e}")
+                    continue
+            
             for coord in coords:
                 cx, cy = int(coord[0]), int(coord[1])
                 
-                if use_openslide:
-                    try:
-                        patch = extract_patch_openslide(wsi_path, cx, cy, patch_size)
-                    except:
-                        continue
-                else:
-                    try:
-                        wsi = cv.imread(wsi_path)
-                        if wsi is None:
-                            from skimage import io
-                            wsi = io.imread(wsi_path)
-                        if len(wsi.shape) == 2:
-                            wsi = cv.cvtColor(wsi, cv.COLOR_GRAY2RGB)
-                        elif wsi.shape[2] == 4:
-                            wsi = cv.cvtColor(wsi, cv.COLOR_RGBA2RGB)
+                try:
+                    if use_openslide:
+                        # Extract patch using already-opened slide
+                        top_left = (max(0, cx - half), max(0, cy - half))
+                        region = slide.read_region(top_left, 0, (patch_size, patch_size))
+                        region = region.convert('RGB')
+                        patch = np.array(region)
+                    else:
+                        # Extract patch from already-loaded WSI
                         patch = extract_patch_numpy(wsi, cx, cy, patch_size)
-                    except:
-                        continue
-                
-                if len(patch.shape) == 2:
-                    patch = cv.cvtColor(patch, cv.COLOR_GRAY2RGB)
-                
-                patches.append(patch)
-                patch_coords.append((cx, cy))
+                    
+                    if len(patch.shape) == 2:
+                        patch = cv.cvtColor(patch, cv.COLOR_GRAY2RGB)
+                    
+                    patches.append(patch)
+                    patch_coords.append((cx, cy))
+                except:
+                    continue
+            
+            # Close slide if using OpenSlide
+            if use_openslide:
+                slide.close()
             
             if len(patches) == 0:
                 continue
@@ -178,18 +200,30 @@ def extract_and_cache_features(dataset, encoder, cfg, encoder_name, device):
                 patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
                 patch_tensors.append(patch_tensor)
             
-            # Batch process
-            batch = torch.stack(patch_tensors).to(device)
+            # Batch process with smaller chunks to avoid OOM
+            feature_batch_size = getattr(cfg.dataset, 'feature_batch_size', 32)
+            all_features = []
             
-            with torch.cuda.amp.autocast():
-                if hasattr(encoder, 'vision_model'):
-                    # MedCLIP
-                    features = encoder.vision_model(batch)
-                else:
-                    # Virchow2 or DinoV3
-                    features = encoder(batch)
+            for i in range(0, len(patch_tensors), feature_batch_size):
+                batch_end = min(i + feature_batch_size, len(patch_tensors))
+                batch = torch.stack(patch_tensors[i:batch_end]).to(device)
+                
+                with torch.amp.autocast('cuda'):
+                    if hasattr(encoder, 'vision_model'):
+                        # MedCLIP
+                        batch_features = encoder.vision_model(batch)
+                    else:
+                        # Virchow2 or DinoV3
+                        batch_features = encoder(batch)
+                
+                all_features.append(batch_features.cpu())
+                
+                # Clean up GPU memory
+                del batch, batch_features
+                torch.cuda.empty_cache()
             
-            features = features.cpu()
+            # Concatenate all features
+            features = torch.cat(all_features, dim=0)
             
             # Save features and coordinates
             torch.save({

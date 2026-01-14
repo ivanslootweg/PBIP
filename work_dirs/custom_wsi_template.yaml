@@ -38,6 +38,8 @@ dataset:
   coordinates_suffix: .npy  # or .txt for text-based coordinates
   mask_suffix: .tif  # file extension for ground truth masks
   use_openslide: true
+  # Batch size for feature extraction (reduce if OOM errors occur)
+  feature_batch_size: 16  # Process 16 patches at a time to avoid GPU memory issues
   # Input size (used by model)
   input_size:
     - 224

@@ -59,4 +59,4 @@ flowchart TD
 - Coordinate sets: `prototype_coordinates/{class}_{uid}.npy`
 
 ## Next steps
-- Follow-on work (paper arXiv:2503.12068): train a DeepSeek vision/VLM model on the Stage 1 CAMs as pseudo-labels. See [docs/next_steps.md](docs/next_steps.md) for the workflow and open items to align with the paper.
+- Follow-on work (paper arXiv:2503.12068): train a Deeplab-v2 vision/VLM model on the Stage 1 CAMs as pseudo-labels. See [docs/next_steps.md](docs/next_steps.md) for the workflow and open items to align with the paper.
