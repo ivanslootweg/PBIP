@@ -20,13 +20,25 @@ model:
 # Work directory for all outputs
 work_dir: /data/pathology/projects/ivan/WSS/PBIP
 
+# Run-specific output organization (auto-generated UID based on data selection)
+# UID format: {numqdd_per_wsi}_{num_wsis_per_class}_{selection_method}_{file_hash}
+# Example: "10000_50_pseudo-pct85_a3f7b2c1" means:
+#   - 10000 patches per WSI
+#   - 50 WSIs per class
+#   - Pseudo-label selection with percentile strategy at 85% threshold
+#   - Hash a3f7b2c1 from selected slide names
+# This UID is generated during extract_patches.py and reused across the pipeline
+run_uid: null  # Auto-filled by pipeline, or set manually to use specific run
+
 dataset:
   name: custom_wsi
+  # Enable patch-level training (uses prototype coordinates directly)
+  use_patch_level_dataset: true  # NEW: train on all high-confidence patches
   # Optional: order of parent classes used for prototypes
   class_order: [benign, tumor]
   # Paths to data directories
   wsi_dir: /data/pa_cpgarchive/archives/skin/internal/images/derived/packed_p2/packed
-  coordinates_dir: /data/pa_cpgarchive/archives/skin/internal/images/derived/features_virchow_p2_f3/coordinates
+  coordinates_dir: /data/pathology/projects/ivan/DeepDerma/MOHS_READER/heatmaps/mohs_cycle/components_overlap_0.5/patches/patches
   split_csv: "/data/pathology/projects/ivan/DeepDerma/documents/classifier_splits/mohs_based_on_2024_test/splits_0.csv"
   labels_csv: /data/pathology/projects/ivan/WSS/labels_dummy.csv
   # gt_dir: /data/pathology/projects/ivan/DeepDerma/MOHS_READER/bcc_annotations/AI_bcc_tumormaps # binary labels per pixel. 0 = no tumor. 1 =  tumor
@@ -35,7 +47,7 @@ dataset:
   num_classes: 2
   patch_size: 224
   max_patches: null  # Use all patches (null) or limit to N patches per WSI
-  coordinates_suffix: .npy  # or .txt for text-based coordinates
+  coordinates_suffix: _patches.h5  # Suffix after filename (e.g., filename_patches.h5)
   mask_suffix: .tif  # file extension for ground truth masks
   use_openslide: true
   # Batch size for feature extraction (reduce if OOM errors occur)
@@ -45,26 +57,101 @@ dataset:
     - 224
     - 224
 
+  # ===== WSI-level Pseudo-Label Configuration =====
+  # Enable pseudo-label driven patch selection for WSI-level classification
+  use_pseudo_labels: true
+  
+  # Directory containing .pt files with attention scores for each WSI
+  # Each file should contain attention scores for patches at coordinates
+  # Expected structure: pseudo_label_dir/<wsi_name>.pt
+  pseudo_label_dir: /data/pathology/projects/ivan/WSS/weak_labels
+  
+  # Binary mode: True for single-channel attention scores (low=class0, high=class1)
+  #             False for multi-class mode (num_classes channels, one per class)
+  pseudo_label_binary_mode: true
+  
+  # Patch selection strategy for building prototype banks from high-confidence patches
+  # Options: 
+  #   'percentile': Select patches in top percentile (recommended, default)
+  #   'threshold': Select patches above absolute threshold
+  #   'entropy': Select patches with lowest entropy (most confident)
+  #   'margin': Select patches with largest margin between top-2 classes
+  pseudo_label_selection_strategy: percentile
+  
+  # Per-class confidence thresholds for selecting high-quality patches
+  # Different classes can have different confidence requirements
+  # For binary mode: class 0 confidence = 1 - score, class 1 confidence = score
+  # 
+  # For 'percentile' strategy: value between 0-1 (e.g., 0.995 = top 0.5% patches)
+  # For 'threshold' strategy: absolute threshold in [0, 1] range
+  # For 'entropy' strategy: entropy threshold (lower = more confident)
+  # For 'margin' strategy: margin threshold between classes
+  # 
+  # Format options:
+  #   Single value:  0.995              # Same threshold for all classes
+  #   List format:   [0.85, 0.995]      # [benign: 85%, tumor: 99.5%]
+  #   Dict format:   {0: 0.85, 1: 0.995}  # {benign: 85%, tumor: 99.5%}
+  # 
+  # Example: Use stricter threshold (99.5%) for tumor to reduce false positives,
+  #          while using more lenient threshold (85%) for benign patches
+  pseudo_label_per_class_thresholds: {0: 0.85, 1: 0.998}  # {benign, tumor}
+  
+  # Classes that require pseudo-labels (optional)
+  # For benign slides, all patches are class 0, so pseudo-labels aren't needed
+  # Only tumor slides (class 1) need pseudo-labels to identify high-confidence tumor patches
+  # 
+  # Format:
+  #   null or omit: Require pseudo-labels for all classes
+  #   [1]: Only require pseudo-labels for tumor (class 1), use random sampling for benign
+  #   [0, 1]: Require pseudo-labels for both classes
+  # 
+  # Recommended for binary classification: [1] (tumor only)
+  pseudo_label_required_classes: [1]  # Only require pseudo-labels for tumor class
+  
+  # Minimum number of selected patches per WSI to be usable for prototype construction
+  # Prevents prototype bank from being poisoned by weak-label artifacts
+  pseudo_label_min_patches: 5
+  
+  # Whether to analyze pseudo-label quality and print statistics
+  pseudo_label_analyze: true
+
 features:
   # Folder with prototype exemplar images arranged by class, e.g.,
   # proto_image_dir/benign/*.png, proto_image_dir/tumor/*.png, ...
-  proto_image_dir: ${work_dir}/prototypes
+  proto_image_dir: ${work_dir}/runs/${run_uid}/prototypes
   # Where to save MedCLIP image features and final label feature .pkl
-  save_dir: ${work_dir}/image_features
+  save_dir: ${work_dir}/runs/${run_uid}/image_features
   # Intermediate MedCLIP features filename (per-exemplar features)
-  medclip_features_pkl: medclip_exemplars.pkl
+  medclip_features_pkl: medclip_exemplars_${run_uid}.pkl
   # Final label feature filename produced by k-means clustering
-  label_feature_pkl: label_fea_pro.pkl
+  label_feature_pkl: label_fea_pro_${run_uid}.pkl
   # Number of subclasses per parent class (length must equal class_order length)
   k_list: [3, 3]
+  # Number of representative images per subclass (Nk from paper)
+  # Paper uses Nk=5: select 5 images closest to each cluster center
+  nk: 5
 
 output_dirs:
-  ckpt_dir:  ${work_dir}/checkpoints
-  pred_dir:  ${work_dir}/predictions
-  train_log_dir:  ${work_dir}/training_logs
+  # Checkpoint organization: Config-based instead of timestamp
+  # Format: {work_dir}/runs/{run_uid}/checkpoints/{config_id}/
+  # Where config_id = {lr}_{batch_size}_{epochs}_{hash}
+  # Example: lr1e5_bs10_ep10_a3f7b2c1d4e5
+  # 
+  # A config_registry.yaml file in work_dir maps config_ids to their full settings:
+  #   lr1e5_bs10_ep10_a3f7b2c1d4e5:
+  #     lr: 0.00001
+  #     batch_size: 10
+  #     epochs: 10
+  #     scale3_weight: 1.0
+  #     ... (all hyperparameters)
+  #     first_used: "2026-01-14 15:30:00"
+
+  ckpt_dir:  ${work_dir}/runs/${run_uid}/checkpoints
+  pred_dir:  ${work_dir}/runs/${run_uid}/predictions
+  train_log_dir:  ${work_dir}/runs/${run_uid}/training_logs
 
 train:
-  samples_per_gpu: 10  # Batch size
+  samples_per_gpu: 5  # Batch size
   epoch: 10  # Paper uses 10 epochs for Stage 1 (Section 4.1)
   pretrained: true  # ImageNet pretrained backbone
   # Multi-scale classification loss weights from paper (Section 3.2, Equation 3)
@@ -92,3 +179,10 @@ scheduler:
   warmup_iter: 0
   warmup_ratio: 1.0e-06
   power: 1.0
+
+wandb:
+  # Weights & Biases experiment tracking configuration
+  project: PBIP-WSI-Segmentation  # W&B project name
+  entity: null  # W&B team/username (null = use default)
+  enabled: true  # Set to false to disable wandb logging
+  tags: []  # Additional custom tags (dataset, backbone, encoder auto-added)

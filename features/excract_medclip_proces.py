@@ -68,23 +68,49 @@ def extract_patch(wsi_path, x, y, patch_size, use_openslide=True):
     return patch
 
 
-def load_prototype_coordinates(coordinates_dir, class_name):
+def load_prototype_coordinates(coordinates_dir, class_name, expected_uid=None):
     """Load prototype coordinates from .npy file.
     
-    Searches for files matching pattern: {class_name}_*.npy (UID-based)
-    Falls back to {class_name}.npy (legacy format)
+    Args:
+        coordinates_dir: Directory containing coordinate files
+        class_name: Name of class (e.g., 'benign', 'tumor')
+        expected_uid: If provided, only load coordinates with this specific UID
     
     Returns:
         (coords_x, coords_y, wsi_names, uid) tuple
         uid is None for legacy files
     """
-    # First try to find UID-based file
+    # If we have an expected UID, try that first
+    if expected_uid:
+        coord_path = os.path.join(coordinates_dir, f"{class_name}_{expected_uid}.npy")
+        if os.path.exists(coord_path):
+            print(f"  Loading coordinates: {class_name}_{expected_uid}.npy")
+            data = np.load(coord_path, allow_pickle=True)
+            
+            # Handle structured array (slide2vec format)
+            if isinstance(data, np.ndarray) and data.dtype.names:
+                x = data['x']
+                y = data['y']
+                wsi_names = data['wsi_name'] if 'wsi_name' in data.dtype.names else None
+                return x, y, wsi_names, expected_uid
+            else:
+                # Simple array (legacy format)
+                if len(data.shape) == 1:
+                    x = data[::2]
+                    y = data[1::2]
+                else:
+                    x = data[:, 0]
+                    y = data[:, 1]
+                return x, y, None, expected_uid
+    
+    # Otherwise, try to find UID-based file
     uid_pattern = os.path.join(coordinates_dir, f"{class_name}_*.npy")
     uid_files = glob.glob(uid_pattern)
     
     uid = None
     if uid_files:
-        # Use most recent UID file (or first one if there are multiple)
+        # Sort by modification time, use most recent
+        uid_files.sort(key=os.path.getmtime, reverse=True)
         coord_path = uid_files[0]
         # Extract UID from filename: {class_name}_{uid}.npy
         filename = os.path.basename(coord_path)
@@ -119,11 +145,6 @@ def load_prototype_coordinates(coordinates_dir, class_name):
 
 def extract_features_from_config(cfg):
     set_seed(42)
-    model = MedCLIPModel(vision_cls=MedCLIPVisionModelViT)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
 
     # Read class order and data paths from config
     class_order = list(getattr(cfg.dataset, 'class_order', ['benign', 'tumor']))
@@ -132,21 +153,37 @@ def extract_features_from_config(cfg):
     patch_size = getattr(cfg.dataset, 'patch_size', 224)
     use_openslide = getattr(cfg.dataset, 'use_openslide', HAS_OPENSLIDE)
     
-    # Prototype coordinates directory (where coordinates are stored)
-    proto_coords_dir = os.path.join(os.path.dirname(cfg.features.save_dir), 'prototype_coordinates')
+    # Prototype coordinates directory (where extract_patches.py saves them)
+    proto_coords_dir = os.path.join(cfg.work_dir, 'prototype_coordinates')
+    
+    # Read UID from latest_uid.txt if run_uid is null
+    uid = getattr(cfg, 'run_uid', None)
+    if uid is None or uid == 'null':
+        uid_file = os.path.join(proto_coords_dir, 'latest_uid.txt')
+        if os.path.exists(uid_file):
+            with open(uid_file, 'r') as f:
+                uid = f.read().strip()
+            print(f"Using UID from {uid_file}: {uid}")
     
     save_dir = cfg.features.save_dir
     output_name = cfg.features.medclip_features_pkl
 
     os.makedirs(save_dir, exist_ok=True)
     
-    # Load first coordinate set to extract UID
-    sample_coords_x, sample_coords_y, sample_wsi_names, uid = load_prototype_coordinates(proto_coords_dir, class_order[0])
+    # Load first coordinate set to verify it exists and get UID if needed
+    sample_coords_x, sample_coords_y, sample_wsi_names, coord_uid = load_prototype_coordinates(proto_coords_dir, class_order[0], expected_uid=uid)
     
+    # Use coordinate UID if we didn't get one from config
+    if uid is None:
+        uid = coord_uid
+    
+    # Resolve UID placeholders in paths if needed
     if uid:
-        # Use UID in filename
-        base_name = output_name.replace('.pkl', '')
-        save_path = os.path.join(save_dir, f"{base_name}_{uid}.pkl")
+        # Replace ${run_uid} in save_dir if present
+        save_dir = save_dir.replace('${run_uid}', uid).replace('None', uid)
+        output_name = output_name.replace('${run_uid}', uid).replace('None', uid)
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, output_name)
     else:
         save_path = os.path.join(save_dir, output_name)
     
@@ -156,12 +193,19 @@ def extract_features_from_config(cfg):
         print("  Skipping feature extraction (delete file to re-extract)")
         return save_path  # Return path so caller knows where features are
 
+    model = MedCLIPModel(vision_cls=MedCLIPVisionModelViT)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+
+
     features_dict = {}
     for class_name in class_order:
         features_dict[class_name] = []
 
-        # Load prototype coordinates
-        coords_x, coords_y, wsi_names, class_uid = load_prototype_coordinates(proto_coords_dir, class_name)
+        # Load prototype coordinates (using the UID we determined earlier)
+        coords_x, coords_y, wsi_names, class_uid = load_prototype_coordinates(proto_coords_dir, class_name, expected_uid=uid)
         
         if coords_x is None:
             print(f"Warning: prototype coordinates not found for {class_name} — skipping class")

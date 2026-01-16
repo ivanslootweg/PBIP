@@ -112,9 +112,16 @@ class ClsNetwork(nn.Module):
             info = pkl.load(lf)
             self.l_fea = info['features'].cpu()
             self.k_list = info['k_list']
+            self.nk = info.get('nk', 1)  # Nk representative images per subclass (paper uses 5)
             self.cumsum_k = info['cumsum_k']
             
-        self.total_classes = sum(self.k_list)  # 总类别数
+            print(f"Loaded label features:")
+            print(f"  Feature shape: {self.l_fea.shape}")
+            print(f"  K (subclasses per class): {self.k_list}")
+            print(f"  Nk (representatives per subclass): {self.nk}")
+            print(f"  Total features stored: {self.l_fea.shape[0]} = {sum(self.k_list)} × {self.nk}")
+            
+        self.total_classes = sum(self.k_list) * self.nk  # K * Nk total features
         self.logit_scale1 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
         self.logit_scale2 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
         self.logit_scale3 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
@@ -182,4 +189,4 @@ class ClsNetwork(nn.Module):
         cam4 = out4.clone()
         cls4 = self.pooling(out4, (1, 1)).view(-1, self.total_classes)
 
-        return cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, self.k_list
+        return cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, self.k_list, self.nk

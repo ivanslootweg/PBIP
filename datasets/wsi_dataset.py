@@ -27,6 +27,7 @@ from skimage import io
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.common import load_coordinates, extract_patch_numpy, extract_patch_openslide
+from utils.pseudo_labels import PseudoLabelLoader, PatchSelector
 
 try:
     import wholeslidedata as wsd
@@ -571,3 +572,211 @@ class TileDataset(Dataset):
         except Exception as e:
             print(f"OpenSlide patch extraction failed: {e}")
             raise
+
+class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDataset):
+    """
+    Enhanced training dataset that integrates pseudo-label driven patch selection.
+    
+    This dataset extends CustomWSIPatchTrainingDataset to support WSI-level classification
+    by incorporating attention scores (pseudo-labels) for each patch coordinate. It enables
+    the "Selection-then-Prompting" strategy for building high-quality prototype banks.
+    
+    Only patches with high attention scores (high confidence) are used for prototype
+    construction, preventing the prototype bank from being "poisoned" by weak-label artifacts.
+    
+    Args:
+        use_pseudo_labels: Whether to enable pseudo-label filtering
+        pseudo_label_dir: Directory containing .pt files with attention scores
+        pseudo_label_binary_mode: If True, interpret scores as binary (low/high). 
+                                  If False, multi-class (one score per class)
+        pseudo_label_selection_strategy: Strategy for selecting patches ('percentile', 
+                                        'threshold', 'entropy', 'margin')
+        pseudo_label_confidence_threshold: Confidence threshold for selection
+        pseudo_label_min_patches: Minimum selected patches per WSI to be usable
+        ... (other CustomWSIPatchTrainingDataset arguments)
+    """
+    
+    def __init__(
+        self,
+        wsi_dir: str,
+        coordinates_dir: str,
+        split_csv: str,
+        split: str = "train",
+        class_labels_dict: Optional[Dict] = None,
+        num_classes: int = 4,
+        patch_size: int = 224,
+        max_patches: Optional[int] = None,
+        coordinates_suffix: str = ".npy",
+        transform=None,
+        use_openslide: Optional[bool] = None,
+        # Pseudo-label specific arguments
+        use_pseudo_labels: bool = True,
+        pseudo_label_dir: Optional[str] = None,
+        pseudo_label_binary_mode: bool = True,
+        pseudo_label_selection_strategy: str = 'percentile',
+        pseudo_label_confidence_threshold: float = 0.85,
+        pseudo_label_min_patches: int = 5,
+        pseudo_label_analyze: bool = True,
+    ):
+        super().__init__(
+            wsi_dir=wsi_dir,
+            coordinates_dir=coordinates_dir,
+            split_csv=split_csv,
+            split=split,
+            class_labels_dict=class_labels_dict,
+            num_classes=num_classes,
+            patch_size=patch_size,
+            max_patches=max_patches,
+            coordinates_suffix=coordinates_suffix,
+            transform=transform,
+            use_openslide=use_openslide,
+        )
+        
+        self.use_pseudo_labels = use_pseudo_labels
+        self.pseudo_label_dir = pseudo_label_dir
+        self.pseudo_label_binary_mode = pseudo_label_binary_mode
+        self.pseudo_label_selection_strategy = pseudo_label_selection_strategy
+        self.pseudo_label_confidence_threshold = pseudo_label_confidence_threshold
+        self.pseudo_label_min_patches = pseudo_label_min_patches
+        
+        # Initialize pseudo-label components if enabled
+        if self.use_pseudo_labels and pseudo_label_dir:
+            try:
+                self.pseudo_label_loader = PseudoLabelLoader(
+                    pseudo_label_dir=pseudo_label_dir,
+                    binary_mode=pseudo_label_binary_mode,
+                    num_classes=num_classes,
+                )
+                
+                self.patch_selector = PatchSelector(
+                    num_classes=num_classes,
+                    selection_strategy=pseudo_label_selection_strategy,
+                )
+                
+                # Pre-load and analyze pseudo-labels
+                self._initialize_pseudo_labels(pseudo_label_analyze)
+                
+            except Exception as e:
+                print(f"Warning: Failed to initialize pseudo-labels: {e}")
+                print("Continuing without pseudo-label filtering")
+                self.use_pseudo_labels = False
+        else:
+            self.pseudo_label_loader = None
+            self.patch_selector = None
+    
+    def _initialize_pseudo_labels(self, analyze: bool = True):
+        """Load pseudo-labels for all samples and analyze quality."""
+        print("\n" + "="*70)
+        print("PSEUDO-LABEL INITIALIZATION")
+        print("="*70)
+        
+        # Load pseudo-labels for all samples
+        self.pseudo_label_scores = {}  # wsi_name -> scores tensor
+        self.high_conf_patch_indices = {}  # wsi_name -> selected patch indices
+        
+        skipped_wsis = []
+        insufficient_patches = []
+        
+        for wsi_name in self.filenames:
+            try:
+                # Load scores for this WSI
+                scores = self.pseudo_label_loader.load_wsi_scores(wsi_name)
+                self.pseudo_label_scores[wsi_name] = scores
+                
+                # Select high-confidence patches
+                selected_mask = self.patch_selector.select_patches(
+                    scores,
+                    confidence_threshold=self.pseudo_label_confidence_threshold,
+                    return_scores=False
+                )
+                
+                selected_indices = np.where(selected_mask)[0]
+                
+                # Check minimum threshold
+                if len(selected_indices) < self.pseudo_label_min_patches:
+                    insufficient_patches.append((wsi_name, len(selected_indices)))
+                    self.high_conf_patch_indices[wsi_name] = selected_indices
+                else:
+                    self.high_conf_patch_indices[wsi_name] = selected_indices
+                    
+            except Exception as e:
+                print(f"Warning: Failed to load pseudo-labels for {wsi_name}: {e}")
+                skipped_wsis.append(wsi_name)
+        
+        # Print statistics
+        print(f"\nLoaded pseudo-labels for {len(self.pseudo_label_scores)}/{len(self.filenames)} WSIs")
+        
+        if skipped_wsis:
+            print(f"Skipped {len(skipped_wsis)} WSIs due to errors (first 5):")
+            for wsi_name in skipped_wsis[:5]:
+                print(f"  - {wsi_name}")
+        
+        if insufficient_patches:
+            print(f"\n{len(insufficient_patches)} WSIs have insufficient high-confidence patches:")
+            print(f"  (minimum required: {self.pseudo_label_min_patches})")
+            for wsi_name, num_patches in insufficient_patches[:5]:
+                print(f"  - {wsi_name}: {num_patches} patches")
+        
+        # Analyze global statistics if requested
+        if analyze and self.pseudo_label_loader:
+            try:
+                from utils.pseudo_labels import PseudoLabelAnalyzer
+                analyzer = PseudoLabelAnalyzer(self.pseudo_label_loader)
+                stats = analyzer.analyze_all_wsis()
+                
+                print(f"\nGlobal Pseudo-Label Statistics:")
+                print(f"  Mode: {'Binary' if self.pseudo_label_binary_mode else 'Multi-class'}")
+                print(f"  Total WSIs analyzed: {stats['num_wsis']}")
+                
+                if 'global_stats' in stats:
+                    gs = stats['global_stats']
+                    if 'mean' in gs:
+                        print(f"  Global mean score: {gs['mean']:.4f}")
+                        print(f"  Global std: {gs['std']:.4f}")
+                        print(f"  Global min: {gs['min']:.4f}")
+                        print(f"  Global max: {gs['max']:.4f}")
+            except Exception as e:
+                print(f"Warning: Could not analyze pseudo-label statistics: {e}")
+        
+        print("="*70 + "\n")
+    
+    def get_high_confidence_patches(self, wsi_name: str) -> np.ndarray:
+        """
+        Get indices of high-confidence patches for a WSI.
+        
+        Returns:
+            numpy array of patch indices selected by the patch selector
+        """
+        if not self.use_pseudo_labels or wsi_name not in self.high_conf_patch_indices:
+            return None
+        
+        return self.high_conf_patch_indices[wsi_name]
+    
+    def get_wsi_pseudo_scores(self, wsi_name: str) -> Optional[torch.Tensor]:
+        """Get pseudo-label scores for a WSI."""
+        if not self.use_pseudo_labels or wsi_name not in self.pseudo_label_scores:
+            return None
+        
+        return self.pseudo_label_scores[wsi_name]
+    
+    def __getitem__(self, index: int) -> Tuple:
+        """
+        Returns:
+            filename: Original filename
+            image: Extracted patch tensor (C, H, W)
+            cls_label: Image-level class labels
+            patch_id: Placeholder (0)
+            pseudo_label: (optional) Pseudo-label score for this patch coordinate
+        """
+        filename, patch_tensor, cls_label, patch_id = super().__getitem__(index)
+        
+        # Optionally return pseudo-label information
+        if self.use_pseudo_labels:
+            wsi_name = self.filenames[index]
+            pseudo_scores = self.get_wsi_pseudo_scores(wsi_name)
+            
+            if pseudo_scores is not None:
+                # Return tuple with pseudo-label info
+                return filename, patch_tensor, cls_label, patch_id, pseudo_scores
+        
+        return filename, patch_tensor, cls_label, patch_id

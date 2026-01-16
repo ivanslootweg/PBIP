@@ -63,11 +63,11 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             labels = labels.cuda()
             cls_label = cls_label.cuda().float()
 
-            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs, )
+            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, nk = model(inputs, )
 
             # Merge subclass predictions to parent class predictions
             cls1, cls2, cls3, cls4 = merge_multiscale_predictions(
-                [cls1, cls2, cls3, cls4], k_list, method=cfg.train.merge_test)
+                [cls1, cls2, cls3, cls4], k_list, nk=nk, method=cfg.train.merge_test)
 
             # Compute multi-scale weighted loss
             weights = (cfg.train.scale1_weight, cfg.train.scale2_weight,
@@ -86,13 +86,13 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             cams4 = []
             for tta_trans in tta_transform:
                 augmented_tensor = tta_trans.augment_image(inputs)
-                cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(augmented_tensor)
+                cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, nk = model(augmented_tensor)
 
                 # Merge subclass CAMs and predictions to parent classes
                 cam1, cam2, cam3, cam4 = merge_multiscale_cams(
-                    [cam1, cam2, cam3, cam4], k_list, method=cfg.train.merge_test)
+                    [cam1, cam2, cam3, cam4], k_list, nk=nk, method=cfg.train.merge_test)
                 cls1, cls2, cls3, cls4 = merge_multiscale_predictions(
-                    [cls1, cls2, cls3, cls4], k_list, method=cfg.train.merge_test)
+                    [cls1, cls2, cls3, cls4], k_list, nk=nk, method=cfg.train.merge_test)
 
                 cam1 = get_seg_label(cam1, augmented_tensor, cls_label).cuda()
                 cam1 = tta_trans.deaugment_mask(cam1).unsqueeze(dim=0)
@@ -139,7 +139,7 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             labels = labels.cuda()
             cls_label = cls_label.cuda().float()
 
-            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs, )
+            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, nk = model(inputs, )
 
             # Merge subclass CAMs to parent class CAMs
             cam1, cam2, cam3, cam4 = merge_multiscale_cams(

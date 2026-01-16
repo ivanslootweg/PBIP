@@ -16,13 +16,13 @@ except ImportError:
 def load_coordinates(coord_path: str, coordinates_suffix: str = '.npy', 
                     max_patches: Optional[int] = None) -> np.ndarray:
     """
-    Load coordinates from file (.npy or .txt) with optional sampling.
+    Load coordinates from file (.npy, .txt, or .h5) with optional sampling.
     
     Handles both simple arrays and structured arrays (slide2vec format).
     
     Args:
         coord_path: Path to coordinate file
-        coordinates_suffix: File extension (.npy or .txt)
+        coordinates_suffix: File extension (.npy, .txt, .h5, or _patches.h5)
         max_patches: If set, randomly sample this many patches
         
     Returns:
@@ -37,6 +37,28 @@ def load_coordinates(coord_path: str, coordinates_suffix: str = '.npy',
             x_coords = coords['x']
             y_coords = coords['y']
             coords = np.stack([x_coords, y_coords], axis=1)
+    
+    elif coordinates_suffix.endswith('.h5'):
+        # Support both .h5 and _patches.h5
+        import h5py
+        with h5py.File(coord_path, 'r') as f:
+            # Try common keys
+            if 'coords' in f:
+                coords = f['coords'][:]
+            elif 'coordinates' in f:
+                coords = f['coordinates'][:]
+            else:
+                # Use first dataset found
+                keys = list(f.keys())
+                if len(keys) == 0:
+                    raise ValueError(f"No datasets found in {coord_path}")
+                coords = f[keys[0]][:]
+        
+        # Ensure shape is (N, 2)
+        if len(coords.shape) == 2 and coords.shape[1] == 2:
+            pass  # Already correct shape
+        else:
+            raise ValueError(f"Unexpected shape {coords.shape} in h5 file. Expected (N, 2)")
             
     elif coordinates_suffix == ".txt":
         coords = np.loadtxt(coord_path)
@@ -152,41 +174,45 @@ def extract_patch(wsi_path: str, x: int, y: int, patch_size: int,
 
 def merge_multiscale_predictions(predictions: List[torch.Tensor], 
                                  k_list: List[int], 
+                                 nk: int = 1,
                                  method: str = 'mean') -> List[torch.Tensor]:
     """
     Merge all 4 scales of subclass predictions to parent class predictions.
     
     Args:
-        predictions: List of [cls1, cls2, cls3, cls4] tensors
+        predictions: List of [cls1, cls2, cls3, cls4] tensors with shape (batch, K*Nk)
         k_list: Number of subclasses per parent class
+        nk: Number of representative features per subclass (default 1)
         method: Merge method ('mean' or 'max')
         
     Returns:
-        List of merged predictions [cls1_merge, cls2_merge, cls3_merge, cls4_merge]
+        List of merged predictions [cls1_merge, cls2_merge, cls3_merge, cls4_merge] with shape (batch, num_parent_classes)
     """
     from utils.hierarchical_utils import merge_to_parent_predictions
     
-    return [merge_to_parent_predictions(pred, k_list, method=method) 
+    return [merge_to_parent_predictions(pred, k_list, nk=nk, method=method) 
             for pred in predictions]
 
 
 def merge_multiscale_cams(cams: List[torch.Tensor], 
                          k_list: List[int], 
+                         nk: int = 1,
                          method: str = 'mean') -> List[torch.Tensor]:
     """
     Merge all 4 scales of subclass CAMs to parent class CAMs.
     
     Args:
-        cams: List of [cam1, cam2, cam3, cam4] tensors
+        cams: List of [cam1, cam2, cam3, cam4] tensors with shape (batch, K*Nk, H, W)
         k_list: Number of subclasses per parent class
+        nk: Number of representative features per subclass (default 1)
         method: Merge method ('mean' or 'max')
         
     Returns:
-        List of merged CAMs [cam1_merge, cam2_merge, cam3_merge, cam4_merge]
+        List of merged CAMs [cam1_merge, cam2_merge, cam3_merge, cam4_merge] with shape (batch, num_parent_classes, H, W)
     """
     from utils.hierarchical_utils import merge_subclass_cams_to_parent
     
-    return [merge_subclass_cams_to_parent(cam, k_list, method=method) 
+    return [merge_subclass_cams_to_parent(cam, k_list, nk=nk, method=method) 
             for cam in cams]
 
 

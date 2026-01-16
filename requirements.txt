@@ -45,6 +45,9 @@ transformers==4.24.0      # For transformer models
 tokenizers==0.13.3        # For text processing
 huggingface-hub==0.26.1   # For model downloads
 
+# Experiment Tracking
+wandb==0.16.2
+
 # Development and Analysis Tools (optional)
 jupyter==1.0.0
 jupyterlab==4.0.11

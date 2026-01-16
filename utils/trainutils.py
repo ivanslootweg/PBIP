@@ -10,6 +10,7 @@ from albumentations.pytorch import ToTensorV2
 
 from datasets.bcss import BCSSTestDataset, BCSSTrainingDataset, BCSSWSSSDataset
 from datasets.wsi_dataset import CustomWSIPatchTrainingDataset, CustomWSIPatchTestDataset
+from datasets.patch_dataset import PatchLevelTrainingDataset, PatchLevelTestDataset
 
 
 def get_wsss_dataset(cfg):
@@ -163,19 +164,29 @@ def load_class_labels_from_csv(labels_csv: str, num_classes: int = None) -> Dict
 def get_custom_dataset(cfg, split="valid"):
     """
     Load custom WSI patch-based dataset with weak image-level labels.
-    Patches are extracted from WSI files using coordinates.
+    
+    Two modes:
+    1. Patch-level: Uses prototype coordinate files directly (recommended for weak supervision)
+    2. WSI-level: Loads from split CSV with random sampling (original behavior)
     
     Config requirements:
         dataset:
             name: "custom_wsi"
             wsi_dir: "/path/to/wsi/files"
+            use_patch_level_dataset: true  # NEW: enables patch-level training
+            
+            # For patch-level mode:
+            class_order: [benign, tumor]
+            
+            # For WSI-level mode:
             coordinates_dir: "/path/to/coordinates"
-            split_csv: "/path/to/split.csv"  # columns: train, val, test
-            labels_csv: "/path/to/labels.csv"  # columns: image_name, label1, label2, ...
-            gt_dir: "/path/to/ground_truth"  # for val/test
-            num_classes: 4
-            patch_size: 224  # optional
-            coordinates_suffix: ".npy"  # or ".txt"
+            split_csv: "/path/to/split.csv"
+            labels_csv: "/path/to/labels.csv"
+            
+            # Common:
+            gt_dir: "/path/to/ground_truth"
+            num_classes: 2
+            patch_size: 224
     
     Args:
         cfg: Configuration object
@@ -184,12 +195,6 @@ def get_custom_dataset(cfg, split="valid"):
     Returns:
         Tuple of (train_dataset, val_dataset)
     """
-    # Load class labels (num_classes will be auto-inferred from data)
-    class_labels_dict = load_class_labels_from_csv(
-        cfg.dataset.labels_csv, 
-        num_classes=cfg.dataset.get('num_classes', None)
-    )
-    
     # Build transforms consistent with BCSS pipeline
     MEAN, STD = get_mean_std(cfg.dataset.name)
     train_transforms = [
@@ -208,38 +213,93 @@ def get_custom_dataset(cfg, split="valid"):
         "val": A.Compose(val_transforms),
     }
     
-    # Create training dataset (weak labels only)
-    train_dataset = CustomWSIPatchTrainingDataset(
-        wsi_dir=cfg.dataset.wsi_dir,
-        coordinates_dir=cfg.dataset.coordinates_dir,
-        split_csv=cfg.dataset.split_csv,
-        split="train",
-        class_labels_dict=class_labels_dict,
-        num_classes=cfg.dataset.num_classes,
-        patch_size=getattr(cfg.dataset, 'patch_size', 224),
-        max_patches=getattr(cfg.dataset, 'max_patches', None),
-        coordinates_suffix=getattr(cfg.dataset, 'coordinates_suffix', '.npy'),
-        transform=transform["train"],
-        use_openslide=getattr(cfg.dataset, 'use_openslide', None),
-    )
+    # Check if patch-level dataset should be used
+    use_patch_level = getattr(cfg.dataset, 'use_patch_level_dataset', True)
     
-    # Create validation dataset (with GT masks if available)
-    val_split = "val" if split == "valid" else split
-    val_dataset = CustomWSIPatchTestDataset(
-        wsi_dir=cfg.dataset.wsi_dir,
-        coordinates_dir=cfg.dataset.coordinates_dir,
-        split_csv=cfg.dataset.split_csv,
-        gt_dir=cfg.dataset.gt_dir,
-        split=val_split,
-        class_labels_dict=class_labels_dict,
-        num_classes=cfg.dataset.num_classes,
-        patch_size=getattr(cfg.dataset, 'patch_size', 224),
-        max_patches=getattr(cfg.dataset, 'max_patches', None),
-        coordinates_suffix=getattr(cfg.dataset, 'coordinates_suffix', '.npy'),
-        mask_suffix=getattr(cfg.dataset, 'mask_suffix', '.png'),
-        transform=transform["val"],
-        use_openslide=getattr(cfg.dataset, 'use_openslide', None),
-    )
+    if use_patch_level:
+        print("Using PATCH-LEVEL training dataset (all prototype coordinates)")
+        
+        # Get run_uid from config or auto-detect
+        run_uid = getattr(cfg, 'run_uid', None)
+        if run_uid is None:
+            # Try to read from latest_uid.txt
+            uid_file = os.path.join(cfg.work_dir, 'prototype_coordinates', 'latest_uid.txt')
+            if os.path.exists(uid_file):
+                with open(uid_file, 'r') as f:
+                    run_uid = f.read().strip()
+                print(f"Auto-detected run_uid: {run_uid}")
+            else:
+                raise ValueError("run_uid not specified in config and latest_uid.txt not found")
+        
+        # Get prototype coordinates directory
+        proto_coords_dir = os.path.join(cfg.work_dir, 'prototype_coordinates')
+        
+        # Create patch-level training dataset
+        train_dataset = PatchLevelTrainingDataset(
+            wsi_dir=cfg.dataset.wsi_dir,
+            proto_coords_dir=proto_coords_dir,
+            run_uid=run_uid,
+            class_order=getattr(cfg.dataset, 'class_order', ['benign', 'tumor']),
+            num_classes=cfg.dataset.num_classes,
+            patch_size=getattr(cfg.dataset, 'patch_size', 224),
+            transform=transform["train"],
+            use_openslide=getattr(cfg.dataset, 'use_openslide', None),
+        )
+        
+        # Create patch-level validation dataset
+        val_dataset = PatchLevelTestDataset(
+            wsi_dir=cfg.dataset.wsi_dir,
+            gt_dir=cfg.dataset.gt_dir,
+            proto_coords_dir=proto_coords_dir,
+            run_uid=run_uid,
+            class_order=getattr(cfg.dataset, 'class_order', ['benign', 'tumor']),
+            num_classes=cfg.dataset.num_classes,
+            patch_size=getattr(cfg.dataset, 'patch_size', 224),
+            transform=transform["val"],
+            use_openslide=getattr(cfg.dataset, 'use_openslide', None),
+        )
+        
+    else:
+        print("Using WSI-LEVEL training dataset (random sampling from split CSV)")
+        
+        # Load class labels (num_classes will be auto-inferred from data)
+        class_labels_dict = load_class_labels_from_csv(
+            cfg.dataset.labels_csv, 
+            num_classes=cfg.dataset.get('num_classes', None)
+        )
+        
+        # Create training dataset (weak labels only)
+        train_dataset = CustomWSIPatchTrainingDataset(
+            wsi_dir=cfg.dataset.wsi_dir,
+            coordinates_dir=cfg.dataset.coordinates_dir,
+            split_csv=cfg.dataset.split_csv,
+            split="train",
+            class_labels_dict=class_labels_dict,
+            num_classes=cfg.dataset.num_classes,
+            patch_size=getattr(cfg.dataset, 'patch_size', 224),
+            max_patches=getattr(cfg.dataset, 'max_patches', None),
+            coordinates_suffix=getattr(cfg.dataset, 'coordinates_suffix', '.npy'),
+            transform=transform["train"],
+            use_openslide=getattr(cfg.dataset, 'use_openslide', None),
+        )
+        
+        # Create validation dataset (with GT masks if available)
+        val_split = "val" if split == "valid" else split
+        val_dataset = CustomWSIPatchTestDataset(
+            wsi_dir=cfg.dataset.wsi_dir,
+            coordinates_dir=cfg.dataset.coordinates_dir,
+            split_csv=cfg.dataset.split_csv,
+            gt_dir=cfg.dataset.gt_dir,
+            split=val_split,
+            class_labels_dict=class_labels_dict,
+            num_classes=cfg.dataset.num_classes,
+            patch_size=getattr(cfg.dataset, 'patch_size', 224),
+            max_patches=getattr(cfg.dataset, 'max_patches', None),
+            coordinates_suffix=getattr(cfg.dataset, 'coordinates_suffix', '.npy'),
+            mask_suffix=getattr(cfg.dataset, 'mask_suffix', '.png'),
+            transform=transform["val"],
+            use_openslide=getattr(cfg.dataset, 'use_openslide', None),
+        )
     
     return train_dataset, val_dataset
 

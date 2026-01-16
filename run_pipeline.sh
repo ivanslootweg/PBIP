@@ -1,7 +1,7 @@
 #!/bin/bash
 # PBIP End-to-End Training Pipeline
 # This script runs the complete pipeline from prototype extraction to training
-
+export PYTHONPATH="${PYTHONPATH}:/data/pathology/projects/ivan/cloned_tools/PBIP"
 set -e  # Exit on error
 
 echo "=========================================="
@@ -27,7 +27,7 @@ echo "=========================================="
 
 python3 features/extract_patches.py \
     --config work_dirs/custom_wsi_template.yaml \
-    --num_per_wsi 10000 \
+    --num_per_wsi 100 \
     --num_wsis_per_class 50 \
     --generate_thumbnails \
     --num_thumbnail_samples 5

@@ -11,10 +11,13 @@ import numpy as np
 import cv2 as cv
 from omegaconf import OmegaConf
 from tqdm import tqdm
+import hashlib
+import yaml
 import ttach as tta
 from skimage import morphology
 from pathlib import Path
 from PIL import Image
+import wandb
 
 import torch
 import torch.nn as nn
@@ -39,6 +42,90 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=str, default=None)
 parser.add_argument("--gpu", type=int, default=0, help="gpu id")
 args = parser.parse_args()
+
+def generate_config_hash(cfg):
+    """Generate unique hash from training configuration.
+    
+    Includes hyperparameters that affect model training:
+    - Learning rate, optimizer settings
+    - Loss weights
+    - Model architecture settings
+    - Training epochs, batch size
+    
+    Returns:
+        (config_id, config_dict) tuple where config_id is short hash
+    """
+    config_dict = {
+        # Optimizer settings
+        'lr': cfg.optimizer.learning_rate,
+        'optimizer': cfg.optimizer.type,
+        'weight_decay': cfg.optimizer.weight_decay,
+        'betas': list(cfg.optimizer.betas),
+        
+        # Training settings
+        'batch_size': cfg.train.samples_per_gpu,
+        'epochs': cfg.train.epoch,
+        
+        # Loss weights
+        'scale1_w': cfg.train.scale1_weight,
+        'scale2_w': cfg.train.scale2_weight,
+        'scale3_w': cfg.train.scale3_weight,
+        'scale4_w': cfg.train.scale4_weight,
+        'contrastive_w': cfg.train.contrastive_weight,
+        'lambda_cam': cfg.train.lambda_cam,
+        'temperature': cfg.train.temperature,
+        'mask_alpha': cfg.train.mask_adapter_alpha,
+        
+        # Model architecture
+        'backbone': cfg.model.backbone.config,
+        'n_ratio': cfg.model.n_ratio,
+        'patch_encoder': cfg.model.patch_encoder,
+        
+        # Data settings (affects what model learns)
+        'num_classes': cfg.dataset.num_classes,
+        'k_list': list(cfg.features.k_list),
+    }
+    
+    # Create hash from sorted config items for consistency
+    config_str = str(sorted(config_dict.items()))
+    config_hash = hashlib.sha256(config_str.encode()).hexdigest()[:12]
+    
+    # Create readable prefix from key settings
+    lr_str = f"lr{cfg.optimizer.learning_rate:.0e}".replace('e-0', 'e-').replace('e-', 'e')
+    batch_str = f"bs{cfg.train.samples_per_gpu}"
+    epoch_str = f"ep{cfg.train.epoch}"
+    prefix = f"{lr_str}_{batch_str}_{epoch_str}"
+    
+    config_id = f"{prefix}_{config_hash}"
+    
+    return config_id, config_dict
+
+
+def save_config_registry(cfg, config_id, config_dict):
+    """Save config mapping to YAML registry file."""
+    registry_path = os.path.join(cfg.work_dir, 'config_registry.yaml')
+    
+    # Load existing registry or create new
+    if os.path.exists(registry_path):
+        with open(registry_path, 'r') as f:
+            registry = yaml.safe_load(f) or {}
+    else:
+        registry = {}
+    
+    # Add timestamp for tracking when config was first used
+    if config_id not in registry:
+        config_dict['first_used'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        registry[config_id] = config_dict
+        
+        # Save updated registry
+        with open(registry_path, 'w') as f:
+            yaml.dump(registry, f, default_flow_style=False, sort_keys=False)
+        
+        print(f"\n✓ Config registered: {config_id}")
+        print(f"  Registry: {registry_path}")
+    else:
+        print(f"\n✓ Using existing config: {config_id}")
+
 
 def cal_eta(time0, cur_iter, total_iter):
     """Calculate elapsed time and estimated time to completion"""
@@ -359,6 +446,37 @@ def train(cfg):
     print(f"Using device: {device}")
     set_seed(42)
     
+    # Login to wandb using environment variable if available
+    wandb_enabled = getattr(cfg, 'wandb', {}).get('enabled', True)
+    if wandb_enabled:
+        wandb_key = os.environ.get('WANDB_API_KEY')
+        if wandb_key:
+            wandb.login(key=wandb_key)
+            print("✓ Logged in to Weights & Biases using environment key")
+        
+        # Get wandb config settings
+        wandb_config = getattr(cfg, 'wandb', {})
+        project_name = wandb_config.get('project', 'PBIP-WSI-Segmentation')
+        entity = wandb_config.get('entity', None)
+        custom_tags = wandb_config.get('tags', [])
+        
+        # Combine auto-generated tags with custom tags
+        auto_tags = [cfg.dataset.name, cfg.model.backbone.config, cfg.model.patch_encoder]
+        all_tags = auto_tags + (custom_tags if custom_tags else [])
+        
+        # Initialize Weights & Biases
+        wandb.init(
+            project=project_name,
+            entity=entity,
+            name=f"train_{cfg.run_uid}_{config_id}",
+            config=OmegaConf.to_container(cfg, resolve=True),
+            tags=all_tags,
+            notes=f"Prototype-based segmentation with {cfg.model.patch_encoder} features"
+        )
+        print(f"✓ Weights & Biases initialized: {wandb.run.name}")
+    else:
+        print("⚠ Weights & Biases logging disabled in config")
+    
     # Load patch encoder for prototype feature extraction
     encoder_name = getattr(cfg.model, 'patch_encoder', 'medclip')
     print(f"\nInitializing patch encoder: {encoder_name}")
@@ -468,15 +586,15 @@ def train(cfg):
         cls_labels = cls_labels.to(device).float()
         
         with torch.cuda.amp.autocast():
-            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs)
+            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, nk = model(inputs)
 
             # Merge subclass predictions to parent class predictions
             cls1_merge, cls2_merge, cls3_merge, cls4_merge = merge_multiscale_predictions(
-                [cls1, cls2, cls3, cls4], k_list, method=cfg.train.merge_train)
+                [cls1, cls2, cls3, cls4], k_list, nk=nk, method=cfg.train.merge_train)
 
             # Generate binary masks for feature extraction
-            subclass_labels = expand_parent_to_subclass_labels(cls_labels, k_list)
-            cls4_expand=expand_parent_to_subclass_labels(cls4_merge, k_list)
+            subclass_labels = expand_parent_to_subclass_labels(cls_labels, k_list, nk=nk)
+            cls4_expand=expand_parent_to_subclass_labels(cls4_merge, k_list, nk=nk)
             cls4_bir=(cls4>cls4_expand).float()*subclass_labels
 
             # Extract foreground and background features
@@ -528,6 +646,20 @@ def train(cfg):
                 f"LR: {cur_lr:.3e}; Loss: {loss.item():.4f}; "
                 f"Acc4: {all_cls_acc4:.2f}/{avg_cls_acc4:.2f}"
             )
+            
+            # Log training metrics to wandb
+            wandb.log({
+                'train/loss': loss.item(),
+                'train/cls_loss': cls_loss.item(),
+                'train/fg_loss': fg_loss.item(),
+                'train/bg_loss': bg_loss.item(),
+                'train/cam_reg': cam_reg.item(),
+                'train/all_class_acc': all_cls_acc4.item(),
+                'train/avg_class_acc': avg_cls_acc4.item(),
+                'train/learning_rate': cur_lr,
+                'iteration': n_iter + 1,
+                'epoch': (n_iter + 1) / iters_per_epoch
+            })
         # Regular validation and model saving
         if (n_iter + 1) % cfg.train.eval_iters == 0 or (n_iter + 1) == cfg.train.max_iters:
             val_all_acc4, val_avg_acc4, fuse234_score, val_cls_loss = validate(
@@ -540,6 +672,22 @@ def train(cfg):
             print(f"Val all acc4: {val_all_acc4:.6f}")
             print(f"Val avg acc4: {val_avg_acc4:.6f}")
             print(f"Fuse234 score: {fuse234_score}, mIOU: {fuse234_score[:-1].mean():.4f}")
+            
+            # Log validation metrics to wandb
+            val_metrics = {
+                'val/all_class_acc': val_all_acc4,
+                'val/avg_class_acc': val_avg_acc4,
+                'val/mIOU': fuse234_score[:-1].mean(),
+                'val/loss': val_cls_loss,
+                'iteration': n_iter + 1,
+                'epoch': (n_iter + 1) / iters_per_epoch
+            }
+            # Log per-class IoU scores
+            for i, score in enumerate(fuse234_score[:-1]):
+                val_metrics[f'val/iou_class_{i}'] = score
+            if len(fuse234_score) > cfg.dataset.num_classes:
+                val_metrics['val/iou_background'] = fuse234_score[-1]
+            wandb.log(val_metrics)
             
             if fuse234_score[:-1].mean() > best_fuse234_dice:
                 best_fuse234_dice = fuse234_score[:-1].mean()
@@ -557,6 +705,11 @@ def train(cfg):
                     _use_new_zipfile_serialization=True
                 )
                 print(f"\nSaved best model with mIOU: {best_fuse234_dice:.4f}")
+                
+                # Save best model to wandb
+                wandb.run.summary['best_mIOU'] = best_fuse234_dice
+                wandb.run.summary['best_iter'] = n_iter + 1
+                wandb.save(save_path)
 
     torch.cuda.empty_cache()
     end_time = datetime.datetime.now()
@@ -605,6 +758,20 @@ def train(cfg):
         print(f"  Class {i}: {score:.6f}")
     if len(fuse234_score) > cfg.dataset.num_classes:
         print(f"  Background: {fuse234_score[-1]:.6f}")
+    
+    # Log test results to wandb
+    test_metrics = {
+        'test/all_class_acc': test_all_acc4,
+        'test/avg_class_acc': test_avg_acc4,
+        'test/mIOU': fuse234_score[:-1].mean(),
+        'test/loss': test_cls_loss
+    }
+    for i, score in enumerate(fuse234_score[:-1]):
+        test_metrics[f'test/iou_class_{i}'] = score
+    if len(fuse234_score) > cfg.dataset.num_classes:
+        test_metrics['test/iou_background'] = fuse234_score[-1]
+    wandb.log(test_metrics)
+    wandb.run.summary.update(test_metrics)
 
     print("\n2. Extracting patch features with caching...")
     print("-" * 50)
@@ -642,13 +809,40 @@ def train(cfg):
     print(f"  • Model checkpoint: {cfg.output_dirs.ckpt_dir}/best_cam.pth")
     print("="*80)
     
+    # Finish wandb run
+    wandb.finish()
+    print("\n✓ Wandb run finished")
+    
     
 if __name__ == "__main__":
     cfg = OmegaConf.load(args.config)
-    timestamp = "{0:%Y-%m-%d-%H-%M}".format(datetime.datetime.now())
+    
+    # Read UID from latest_uid.txt if run_uid is null
+    if cfg.run_uid is None or str(cfg.run_uid) == 'null':
+        proto_coords_dir = os.path.join(cfg.work_dir, 'prototype_coordinates')
+        uid_file = os.path.join(proto_coords_dir, 'latest_uid.txt')
+        if os.path.exists(uid_file):
+            with open(uid_file, 'r') as f:
+                uid = f.read().strip()
+            # Set run_uid in config so OmegaConf can resolve ${run_uid} placeholders
+            OmegaConf.update(cfg, "run_uid", uid, merge=False)
+            print(f"\n✓ Using UID from {uid_file}: {uid}")
+        else:
+            print(f"\n⚠ Warning: No UID file found at {uid_file}")
+            print("  Run extract_patches.py first to generate prototype coordinates")
+    
+    # Resolve all interpolations (${...} placeholders) in the config
+    cfg = OmegaConf.to_container(cfg, resolve=True)
+    cfg = OmegaConf.create(cfg)
+    
+    # Generate config-based identifier instead of timestamp
+    config_id, config_dict = generate_config_hash(cfg)
+    
+    # Save config to registry for reproducibility
+    save_config_registry(cfg, config_id, config_dict)
 
-    # Create output directories with timestamp for checkpoints
-    cfg.output_dirs.ckpt_dir = os.path.join(cfg.output_dirs.ckpt_dir, timestamp)
+    # Create output directories with config hash for checkpoints
+    cfg.output_dirs.ckpt_dir = os.path.join(cfg.output_dirs.ckpt_dir, config_id)
     
     os.makedirs(cfg.work_dir, exist_ok=True)
     os.makedirs(cfg.output_dirs.ckpt_dir, exist_ok=True)
