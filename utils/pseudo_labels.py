@@ -98,6 +98,8 @@ class PseudoLabelLoader:
         pt_path = self.pseudo_label_dir / wsi_name
         
         if not pt_path.exists():
+            # For benign class (class 0), return None to signal zero pseudo-labels should be used
+            # For other classes, this is an error
             raise FileNotFoundError(f"Pseudo-label file not found: {pt_path}")
         
         # Load with weights_only=False to support numpy arrays (PyTorch 2.6+)
@@ -595,8 +597,8 @@ def create_loader_and_selector(cfg):
     
     Expected config keys:
     - pseudo_label_dir: Path to directory with .pt files
-    - pseudo_label_binary_mode: Boolean, whether to use binary mode
-    - pseudo_label_selection_strategy: Selection strategy name
+    - binary_mode: Boolean, whether to use binary mode
+    - prototype_selection_strategy: Selection strategy name
     - pseudo_label_confidence_threshold: Default confidence threshold
     - num_classes: Number of classes
     
@@ -605,13 +607,13 @@ def create_loader_and_selector(cfg):
     """
     loader = PseudoLabelLoader(
         pseudo_label_dir=cfg.get('pseudo_label_dir'),
-        binary_mode=cfg.get('pseudo_label_binary_mode', True),
+        binary_mode=cfg.get('binary_mode', True),
         num_classes=cfg.get('num_classes', 2),
     )
     
     selector = PatchSelector(
         num_classes=cfg.get('num_classes', 2),
-        selection_strategy=cfg.get('pseudo_label_selection_strategy', 'percentile'),
+        selection_strategy=cfg.get('prototype_selection_strategy', 'percentile'),
     )
     
     return loader, selector

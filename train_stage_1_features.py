@@ -1,20 +1,21 @@
 '''
-Training script for pre-extracted MedCLIP features on WSI patches.
+Training script for feature-based patch-level refinement on WSI patches.
 
-This script trains on pre-computed MedCLIP embeddings instead of raw images.
-The features are already extracted from patches of WSI files.
+This script trains on pre-computed patch features (Virchow2 or DinoV3).
+Features are pre-extracted from patches using the specified encoder.
 
 Usage:
 python train_stage_1_features.py --config ./work_dirs/custom/config.yaml --gpu 0
 
 Configuration file should include:
   dataset:
-    name: wsi
-    feature_dir: /path/to/medclip/features
+    patch_features_dir: /path/to/encoder_features/  (e.g., virchow2_features/)
+    pseudo_label_dir: /path/to/weak_labels/
     split_csv: /path/to/split.csv
     labels_csv: /path/to/labels.csv
-    gt_dir: /path/to/ground_truth
-    num_classes: 4
+    num_classes: 2
+  model:
+    patch_encoder: virchow2  (or dinov3)
 '''
 
 import argparse

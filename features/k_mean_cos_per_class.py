@@ -6,6 +6,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from omegaconf import OmegaConf
 import argparse
 import glob
+import hashlib
+import sys
+from pathlib import Path
+
+# Import common utilities
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.pyutils import build_uid_from_config
 
 class CosineSimilarityKMeans:
     def __init__(self, n_clusters, max_iter=100, random_state=None):
@@ -36,33 +43,29 @@ class CosineSimilarityKMeans:
                 
         return new_labels, similarities, torch.from_numpy(self.cluster_centers_)
 
+
 def cluster_features_per_class(cfg):
-    # Read UID from config or latest_uid.txt
-    uid = getattr(cfg, 'run_uid', None)
-    if uid is None or uid == 'null':
-        proto_coords_dir = os.path.join(cfg.work_dir, 'prototype_coordinates')
-        uid_file = os.path.join(proto_coords_dir, 'latest_uid.txt')
-        if os.path.exists(uid_file):
-            with open(uid_file, 'r') as f:
-                uid = f.read().strip()
-            print(f"Using UID from {uid_file}: {uid}")
+    # Derive UID from config (always construct fresh)
+    uid = build_uid_from_config(cfg)
+    cfg.run_uid = uid
+    print(f"Generated UID from config: {uid}")
     
-    # Resolve UID in save_dir
-    save_dir = cfg.features.save_dir
-    if uid:
-        save_dir = save_dir.replace('${run_uid}', uid).replace('None', uid)
+    # Let OmegaConf resolve ${run_uid}
+    save_dir = OmegaConf.to_container(OmegaConf.create({'save_dir': cfg.features.save_dir}), resolve=True)['save_dir']
     
-    base_medclip_name = cfg.features.medclip_features_pkl.replace('.pkl', '')
-    if uid:
-        base_medclip_name = base_medclip_name.replace('${run_uid}', uid).replace('None', uid)
+    patch_encoder = cfg.features.features_for_prototype_clusters.replace('.pkl', '')
+    # If a different encoder is configured, replace 'medclip' token in filename
+    encoder_name = getattr(cfg.model, 'patch_encoder', 'medclip')
+    if encoder_name.lower().strip() != 'medclip':
+        patch_encoder = patch_encoder.replace('medclip', encoder_name)
     
     # Construct the input path
-    input_pkl = os.path.join(save_dir, base_medclip_name + '.pkl')
+    input_pkl = os.path.join(save_dir, patch_encoder + '.pkl')
     
     if not os.path.exists(input_pkl):
         raise FileNotFoundError(f"MedCLIP features not found at: {input_pkl}\\nPlease run MedCLIP extraction first.")
     
-    print(f"Loading MedCLIP features from: {input_pkl}")
+    print(f"Loading patch features from: {input_pkl}")
     
     with open(input_pkl, 'rb') as f:
         features_dict = pkl.load(f)
@@ -70,6 +73,10 @@ def cluster_features_per_class(cfg):
     k_list = list(cfg.features.k_list)
     nk = getattr(cfg.features, 'nk', 5)  # Paper uses Nk=5 representative images per subclass
     class_order = list(getattr(cfg.dataset, 'class_order', ['benign', 'tumor']))
+
+    # Build case-insensitive lookup for feature dict keys to avoid KeyError when names differ in case
+    available_keys = list(features_dict.keys())
+    normalized_key_map = {k.lower(): k for k in available_keys}
     
     if len(k_list) != len(class_order):
         raise ValueError(f"features.k_list must have {len(class_order)} values (one per parent class in class_order), got {len(k_list)}")
@@ -87,8 +94,17 @@ def cluster_features_per_class(cfg):
         
         class_features = []
         class_names = []
-        
-        for item in features_dict[class_name]:
+
+        if class_name in features_dict:
+            feature_list = features_dict[class_name]
+        else:
+            mapped_key = normalized_key_map.get(class_name.lower())
+            if mapped_key is None:
+                print(f"Warning: features for class '{class_name}' not found. Available keys: {available_keys}. Skipping this class.")
+                continue
+            feature_list = features_dict[mapped_key]
+
+        for item in feature_list:
             class_features.append(item['features'].squeeze())
             class_names.append(item['name'])
         
@@ -122,6 +138,14 @@ def cluster_features_per_class(cfg):
             
             # Stack features for this subclass: (Nk, feature_dim)
             subclass_features_array = np.array(subclass_features)
+            # Pad to Nk if cluster has fewer than Nk samples to keep tensor shapes consistent
+            if subclass_features_array.shape[0] < nk:
+                pad_needed = nk - subclass_features_array.shape[0]
+                if subclass_features_array.shape[0] == 0:
+                    pad_rows = np.tile(cluster_centers[cluster_idx].cpu().numpy(), (pad_needed, 1))
+                else:
+                    pad_rows = np.tile(subclass_features_array[-1], (pad_needed, 1))
+                subclass_features_array = np.concatenate([subclass_features_array, pad_rows], axis=0)
             class_representative_features.append(torch.from_numpy(subclass_features_array))
             representative_indices_per_class[class_name][cluster_idx] = cluster_sample_indices.tolist()
         
@@ -132,6 +156,11 @@ def cluster_features_per_class(cfg):
         all_representative_features.append(class_features_tensor)
     
     # Concatenate all classes: (total_features, feature_dim)
+    if not all_representative_features:
+        raise ValueError(
+            f"No class features clustered. Check dataset.class_order {class_order} against available feature keys {available_keys}."
+        )
+
     all_features_tensor = torch.cat(all_representative_features, dim=0)
     
     save_info = {
@@ -146,10 +175,8 @@ def cluster_features_per_class(cfg):
     # Use same save_dir already resolved with UID
     os.makedirs(save_dir, exist_ok=True)
     
-    # Use UID in label features filename if available
+    # Use label features filename
     base_label_name = cfg.features.label_feature_pkl.replace('.pkl', '')
-    if uid:
-        base_label_name = base_label_name.replace('${run_uid}', uid).replace('None', uid)
     
     save_path = os.path.join(save_dir, base_label_name + '.pkl')
     

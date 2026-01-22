@@ -75,6 +75,14 @@ def load_coordinates(coord_path: str, coordinates_suffix: str = '.npy',
 
 def extract_patch_numpy(wsi: np.ndarray, x: int, y: int, patch_size: int) -> np.ndarray:
     """
+    DEPRECATED: On-the-fly patch extraction from numpy arrays.
+    
+    This function is no longer used in the feature-based training pipeline.
+    It was designed for extracting patches during training from raw WSI files.
+    
+    New approach: Use precomputed patch features loaded via FeatureWSIDataset.
+    This eliminates the need for on-the-fly patch extraction.
+    
     Extract a patch from a numpy array WSI with padding if needed.
     
     Args:

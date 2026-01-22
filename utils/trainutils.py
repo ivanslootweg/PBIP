@@ -8,62 +8,11 @@ import torch.distributed as dist
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from datasets.bcss import BCSSTestDataset, BCSSTrainingDataset, BCSSWSSSDataset
 from datasets.wsi_dataset import CustomWSIPatchTrainingDataset, CustomWSIPatchTestDataset
-from datasets.patch_dataset import PatchLevelTrainingDataset, PatchLevelTestDataset
+# NOTE: PatchLevelTrainingDataset and PatchLevelTestDataset have been removed
+# The new feature-based pipeline uses FeatureWSIDataset instead
+# Legacy patch-level datasets are no longer supported
 
-
-def get_wsss_dataset(cfg):
-    MEAN, STD = get_mean_std(cfg.dataset.name)
-
-    transform = {
-        "train": A.Compose([
-            A.Normalize(MEAN, STD),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.RandomRotate90(),
-            ToTensorV2(transpose_mask=True),
-        ]),
-        "val": A.Compose([
-            A.Normalize(MEAN, STD),
-            ToTensorV2(transpose_mask=True),
-        ])
-    }
-    train_dataset = BCSSWSSSDataset(cfg.dataset.train_root, mask_name=cfg.dataset.mask_root,transform=transform["train"])
-    val_dataset = BCSSTestDataset(cfg.dataset.val_root, split="valid", transform=transform["val"])
-
-    return train_dataset, val_dataset
-
-
-def get_cls_dataset(cfg, split="valid", p=0.5, enable_rotation=True):
-    MEAN, STD = get_mean_std(cfg.dataset.name)
-    
-    # 构建训练时的变换列表
-    train_transforms = [
-        A.Normalize(MEAN, STD),
-        A.HorizontalFlip(p=p),
-        A.VerticalFlip(p=p),
-    ]
-    
-    # 根据参数决定是否添加旋转
-    if enable_rotation:
-        train_transforms.append(A.RandomRotate90())
-    
-    train_transforms.append(ToTensorV2(transpose_mask=True))
-    
-    transform = {
-        "train": A.Compose(train_transforms),
-        "val": A.Compose([
-            A.Normalize(MEAN, STD),
-            ToTensorV2(transpose_mask=True),
-        ]),
-    }
-
-
-    train_dataset = BCSSTrainingDataset(cfg.dataset.train_root, transform=transform["train"])
-    val_dataset = BCSSTestDataset(cfg.dataset.val_root, split, transform=transform["val"])
-
-    return train_dataset, val_dataset
 
 
 def load_class_labels_from_csv(labels_csv: str, num_classes: int = None) -> Dict:
@@ -161,7 +110,7 @@ def load_class_labels_from_csv(labels_csv: str, num_classes: int = None) -> Dict
     return class_labels_dict
 
 
-def get_custom_dataset(cfg, split="valid"):
+def get_custom_dataset(cfg, split="valid", verbose=False):
     """
     Load custom WSI patch-based dataset with weak image-level labels.
     
@@ -190,13 +139,13 @@ def get_custom_dataset(cfg, split="valid"):
     
     Args:
         cfg: Configuration object
-        split: "valid" or "test" for val_dataset
+        split: "valid" or "test" for val_dataset (will be normalized to "val" to match CSV columns)
         
     Returns:
         Tuple of (train_dataset, val_dataset)
     """
-    # Build transforms consistent with BCSS pipeline
-    MEAN, STD = get_mean_std(cfg.dataset.name)
+    # Build transforms for WSI dataset
+    MEAN, STD = get_wsi_normalization()
     train_transforms = [
         A.Normalize(MEAN, STD),
         A.HorizontalFlip(p=0.5),
@@ -213,51 +162,97 @@ def get_custom_dataset(cfg, split="valid"):
         "val": A.Compose(val_transforms),
     }
     
+    # Normalize split names: 'valid' -> 'val' to match CSV column names
+    val_split = "val" if split == "valid" else split
+    
     # Check if patch-level dataset should be used
     use_patch_level = getattr(cfg.dataset, 'use_patch_level_dataset', True)
     
     if use_patch_level:
-        print("Using PATCH-LEVEL training dataset (all prototype coordinates)")
-        
-        # Get run_uid from config or auto-detect
-        run_uid = getattr(cfg, 'run_uid', None)
-        if run_uid is None:
-            # Try to read from latest_uid.txt
-            uid_file = os.path.join(cfg.work_dir, 'prototype_coordinates', 'latest_uid.txt')
-            if os.path.exists(uid_file):
-                with open(uid_file, 'r') as f:
-                    run_uid = f.read().strip()
-                print(f"Auto-detected run_uid: {run_uid}")
-            else:
-                raise ValueError("run_uid not specified in config and latest_uid.txt not found")
-        
-        # Get prototype coordinates directory
-        proto_coords_dir = os.path.join(cfg.work_dir, 'prototype_coordinates')
-        
-        # Create patch-level training dataset
-        train_dataset = PatchLevelTrainingDataset(
-            wsi_dir=cfg.dataset.wsi_dir,
-            proto_coords_dir=proto_coords_dir,
-            run_uid=run_uid,
-            class_order=getattr(cfg.dataset, 'class_order', ['benign', 'tumor']),
-            num_classes=cfg.dataset.num_classes,
-            patch_size=getattr(cfg.dataset, 'patch_size', 224),
-            transform=transform["train"],
-            use_openslide=getattr(cfg.dataset, 'use_openslide', None),
-        )
-        
-        # Create patch-level validation dataset
-        val_dataset = PatchLevelTestDataset(
-            wsi_dir=cfg.dataset.wsi_dir,
-            gt_dir=cfg.dataset.gt_dir,
-            proto_coords_dir=proto_coords_dir,
-            run_uid=run_uid,
-            class_order=getattr(cfg.dataset, 'class_order', ['benign', 'tumor']),
-            num_classes=cfg.dataset.num_classes,
-            patch_size=getattr(cfg.dataset, 'patch_size', 224),
-            transform=transform["val"],
-            use_openslide=getattr(cfg.dataset, 'use_openslide', None),
-        )
+        # If precomputed patch features are provided, use feature-based dataset
+        patch_features_dir = getattr(cfg.dataset, 'patch_features_dir', None)
+        if patch_features_dir:
+            print("Using FEATURE-BASED training dataset (precomputed patch features)")
+            from datasets.feature_dataset import FeatureWSIDataset
+            
+            # Get global_feature_dir from config (optional)
+            global_feature_dir = getattr(cfg.dataset, 'global_feature_dir', None)
+            
+            # Get wsi_dir and auto-generation settings from config
+            wsi_dir = getattr(cfg.dataset, 'wsi_dir', None)
+            auto_generate_patch_features = getattr(cfg.dataset, 'auto_generate_patch_features', True)
+            auto_generate_global_features = getattr(cfg.dataset, 'auto_generate_global_features', False)
+            patch_encoder = getattr(cfg.model, 'patch_encoder', 'virchow2')
+            
+            # Optional: gt_dir for ground truth segmentation masks (validation only)
+            gt_dir = getattr(cfg.dataset, 'gt_dir', None)
+            binary_mode = getattr(cfg.dataset, 'binary_mode', False)
+            coordinates_dir = getattr(cfg.dataset, 'coordinates_dir', None)
+            coordinates_suffix = getattr(cfg.dataset, 'coordinates_suffix', '_patches.h5')
+            patch_size = getattr(cfg.dataset, 'patch_size', 224)
+            
+            # Fallback directories
+            fallback_patch_features_dir = getattr(cfg.dataset, 'fallback_patch_features_dir', None)
+            fallback_coordinates_dir = getattr(cfg.dataset, 'fallback_coordinates_dir', None)
+            fallback_coordinates_suffix = getattr(cfg.dataset, 'fallback_coordinates_suffix', None)
+            
+            # Pseudo-label directory
+            pseudo_label_dir = getattr(cfg.dataset, 'pseudo_label_dir', None)
+
+            train_dataset = FeatureWSIDataset(
+                patch_features_dir=patch_features_dir,
+                split_csv=cfg.dataset.split_csv,
+                labels_csv=cfg.dataset.labels_csv,
+                split="train",
+                num_classes=cfg.dataset.num_classes,
+                global_feature_dir=global_feature_dir,
+                wsi_dir=wsi_dir,
+                auto_generate_patch_features=auto_generate_patch_features,
+                verbose=verbose,
+                auto_generate_global_features=auto_generate_global_features,
+                patch_encoder=patch_encoder,
+                gt_dir=None,  # No GT masks needed for training
+                binary_mode=binary_mode,
+                coordinates_dir=coordinates_dir,
+                coordinates_suffix=coordinates_suffix,
+                patch_size=patch_size,
+                fallback_patch_features_dir=fallback_patch_features_dir,
+                fallback_coordinates_dir=fallback_coordinates_dir,
+                fallback_coordinates_suffix=fallback_coordinates_suffix,
+                pseudo_label_dir=pseudo_label_dir,
+            )
+
+            val_dataset = FeatureWSIDataset(
+                patch_features_dir=patch_features_dir,
+                split_csv=cfg.dataset.split_csv,
+                labels_csv=cfg.dataset.labels_csv,
+                split=val_split,
+                num_classes=cfg.dataset.num_classes,
+                global_feature_dir=global_feature_dir,
+                wsi_dir=wsi_dir,
+                auto_generate_patch_features=auto_generate_patch_features,
+                auto_generate_global_features=auto_generate_global_features,
+                patch_encoder=patch_encoder,
+                gt_dir=gt_dir,  # Enable GT masks for validation if available
+                binary_mode=binary_mode,
+                coordinates_dir=coordinates_dir,
+                coordinates_suffix=coordinates_suffix,
+                patch_size=patch_size,
+                fallback_patch_features_dir=fallback_patch_features_dir,
+                fallback_coordinates_dir=fallback_coordinates_dir,
+                fallback_coordinates_suffix=fallback_coordinates_suffix,
+                pseudo_label_dir=pseudo_label_dir,
+                verbose=verbose,
+            )
+
+        else:
+            # Legacy patch-level dataset is no longer supported
+            raise ValueError(
+                "patch_features_dir must be specified in config. "
+                "The legacy PatchLevelTrainingDataset has been removed. "
+                "Please run 'python features/extract_patch_features.py' first "
+                "to generate patch features, then specify 'patch_features_dir' in your config."
+            )
         
     else:
         print("Using WSI-LEVEL training dataset (random sampling from split CSV)")
@@ -284,7 +279,6 @@ def get_custom_dataset(cfg, split="valid"):
         )
         
         # Create validation dataset (with GT masks if available)
-        val_split = "val" if split == "valid" else split
         val_dataset = CustomWSIPatchTestDataset(
             wsi_dir=cfg.dataset.wsi_dir,
             coordinates_dir=cfg.dataset.coordinates_dir,
@@ -304,9 +298,18 @@ def get_custom_dataset(cfg, split="valid"):
     return train_dataset, val_dataset
 
 
-def get_mean_std(dataset):
-    norm = [[0.66791496, 0.47791372, 0.70623304], [0.1736589,  0.22564577, 0.19820057]]
-    return norm[0], norm[1]
+def get_wsi_normalization():
+    """
+    Get standard normalization statistics for WSI patch data.
+    
+    These are the mean and std from histopathology image datasets.
+    
+    Returns:
+        Tuple of (mean, std) for normalization
+    """
+    mean = [0.66791496, 0.47791372, 0.70623304]
+    std = [0.1736589, 0.22564577, 0.19820057]
+    return mean, std
 
 
 def all_reduced(x, n_gpus):

@@ -28,11 +28,13 @@ import csv
 import sys
 import hashlib
 import h5py
+import torch
 
 # Import common utilities
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.common import extract_patch_numpy, extract_patch_openslide
 from utils.pseudo_labels import PseudoLabelLoader, PatchSelector
+from utils.pyutils import build_uid_from_config
 
 try:
     import openslide
@@ -48,42 +50,67 @@ except:
     HAS_WSD = False
 
 
-def generate_coordinates_uid(num_per_wsi, num_wsis_per_class, filenames, 
-                            use_pseudo_labels=False, pseudo_config=None):
+def find_wsi_file(wsi_dir, base_key):
+    """Find WSI file with any common extension."""
+    wsi_extensions = ['.tif', '.tiff', '.svs', '.ndpi', '.mrxs', '.vms', '.vmu', '.scn', '.bif', '.qptiff']
+    
+    for ext in wsi_extensions:
+        wsi_path = os.path.join(wsi_dir, base_key + ext)
+        if os.path.exists(wsi_path):
+            return wsi_path
+    
+    # Try without extension (some systems)
+    wsi_path = os.path.join(wsi_dir, base_key)
+    if os.path.exists(wsi_path):
+        return wsi_path
+    
+    return None
+
+
+def find_coordinate_file(coordinates_dir, base_key, coordinates_suffix):
+    """Find coordinate file with flexible naming."""
+    # Try exact match first
+    coord_path = os.path.join(coordinates_dir, base_key + coordinates_suffix)
+    if os.path.exists(coord_path):
+        return coord_path
+    
+    # Try with _patches suffix for h5 files
+    if coordinates_suffix == '.h5' or coordinates_suffix.endswith('.h5'):
+        coord_path = os.path.join(coordinates_dir, base_key + "_patches.h5")
+        if os.path.exists(coord_path):
+            return coord_path
+    
+    # Try other common suffixes
+    alt_suffixes = ['.npy', '.npz', '.h5', '.hdf5', '_patches.h5', '.txt']
+    for suf in alt_suffixes:
+        if suf != coordinates_suffix:
+            coord_path = os.path.join(coordinates_dir, base_key + suf)
+            if os.path.exists(coord_path):
+                return coord_path
+    
+    return None
+
+
+def _match_coordinates(coords_x, coords_y, pseudo_coords_x, pseudo_coords_y):
+    """Find coordinate intersections between main coords and pseudo-label coords.
+
+    Returns two index lists of equal length: indices into the main coordinate
+    arrays and the corresponding indices into the pseudo-label coordinates.
     """
-    Generate unique identifier for coordinate set based on selection parameters.
-    
-    UID format: {num_per_wsi}_{num_wsis_per_class}_{selection_info}_{file_hash}
-    
-    Args:
-        num_per_wsi: Max patches per WSI
-        num_wsis_per_class: Max WSIs per class
-        filenames: List of filenames in the coordinate set
-        use_pseudo_labels: Whether pseudo-label selection was used
-        pseudo_config: Dict with pseudo-label config (strategy, threshold, etc.)
-    
-    Returns:
-        UID string (e.g., "10000_50_pseudo-pct85_a3f7b2c1")
-    """
-    # Sort filenames for consistency
-    sorted_names = sorted(filenames)
-    names_str = "|".join(sorted_names)
-    
-    # Hash the sorted filenames
-    file_hash = hashlib.sha256(names_str.encode()).hexdigest()[:8]
-    
-    # Build selection identifier
-    if use_pseudo_labels and pseudo_config:
-        strategy = pseudo_config.get('strategy', 'pct')[:3]  # percentile -> pct
-        threshold = pseudo_config.get('threshold', 0.85)
-        # Convert threshold to integer percentage for cleaner UID
-        threshold_pct = int(threshold * 100)
-        selection_id = f"pseudo-{strategy}{threshold_pct}"
-    else:
-        selection_id = "random"
-    
-    uid = f"{num_per_wsi}_{num_wsis_per_class}_{selection_id}_{file_hash}"
-    return uid
+    pseudo_map = {}
+    for j, (px, py) in enumerate(zip(pseudo_coords_x, pseudo_coords_y)):
+        pseudo_map.setdefault((int(px), int(py)), []).append(j)
+
+    idx_main, idx_pseudo = [], []
+    for i, (cx, cy) in enumerate(zip(coords_x, coords_y)):
+        key = (int(cx), int(cy))
+        if key in pseudo_map and pseudo_map[key]:
+            j = pseudo_map[key].pop()
+            idx_main.append(i)
+            idx_pseudo.append(j)
+            if not pseudo_map[key]:
+                del pseudo_map[key]
+    return idx_main, idx_pseudo
 
 
 def load_class_labels(labels_csv):
@@ -112,7 +139,7 @@ def load_class_labels(labels_csv):
 
 def load_coordinates(coord_path, coordinates_suffix='.npy'):
     """Load coordinates, handling .npy, .txt, and .h5 files."""
-    if coordinates_suffix == '.h5':
+    if coordinates_suffix.endswith('.h5'):
         # Load from HDF5 file
         with h5py.File(coord_path, 'r') as f:
             # Try common keys
@@ -133,7 +160,7 @@ def load_coordinates(coord_path, coordinates_suffix='.npy'):
             y = data[:, 1]
         else:
             raise ValueError(f"Unexpected shape {data.shape} in h5 file {coord_path}. Expected (N, 2)")
-    elif coordinates_suffix == '.npy':
+    elif coordinates_suffix.endswith('.npy'):
         data = np.load(coord_path, allow_pickle=True)
         # Check if it's a structured array (slide2vec format)
         if isinstance(data, np.ndarray) and data.dtype.names:
@@ -294,10 +321,10 @@ def generate_test_thumbnails(cfg, num_samples=5):
     
     generated_count = 0
     for sample_idx, base_key in enumerate(selected_samples):
-        wsi_path = os.path.join(wsi_dir, base_key + ".tif")
+        wsi_path = find_wsi_file(wsi_dir, base_key)
         mask_path = os.path.join(gt_dir, base_key + mask_suffix)
         
-        if not os.path.exists(wsi_path):
+        if not wsi_path:
             print(f"  Warning: WSI not found for {base_key}")
             continue
         
@@ -366,19 +393,26 @@ def generate_test_thumbnails(cfg, num_samples=5):
     print(f"  GT masks: {mask_thumb_dir}")
 
 
-def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
+def extract_patches(cfg, seed=42):
     """Extract patch coordinates from WSIs using image-level labels.
     
     Args:
         cfg: OmegaConf configuration
-        num_per_wsi: Max number of patches to extract from each WSI
-        num_wsis_per_class: Max number of WSIs to process per class
         seed: Random seed for reproducibility
     """
     
     # Set random seeds for reproducibility
     random.seed(seed)
     np.random.seed(seed)
+    
+    # Read prototype extraction parameters from config
+    n_slides_per_class_for_prototypes = getattr(cfg.features, 'n_slides_per_class_for_prototypes', 20)
+    selection_method = getattr(cfg.features, 'selection_method', 'top_attention')
+    
+    print(f"\n=== Prototype Extraction Configuration ===")
+    print(f"Max slides per class: {n_slides_per_class_for_prototypes}")
+    print(f"Selection method: {selection_method}")
+    print(f"Random seed: {seed}")
     
     wsi_dir = cfg.dataset.wsi_dir
     coordinates_dir = cfg.dataset.coordinates_dir
@@ -388,25 +422,34 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
     use_openslide = getattr(cfg.dataset, 'use_openslide', HAS_OPENSLIDE)
     coordinates_suffix = getattr(cfg.dataset, 'coordinates_suffix', '.npy')
     
+    # Optional pseudo-label coordinate files (used when pseudo-label counts mismatch coordinates)
+    pseudo_label_coord_dir = getattr(cfg.dataset, 'pseudo_label_coordinates_dir', None)
+    pseudo_label_coord_suffix = getattr(cfg.dataset, 'pseudo_label_coordinates_suffix', coordinates_suffix)
+
+    # Fallback directories
+    fallback_wsi_dir = getattr(cfg.dataset, 'fallback_wsi_dir', None)
+    fallback_coordinates_dir = getattr(cfg.dataset, 'fallback_coordinates_dir', None)
+    fallback_coordinates_suffix = getattr(cfg.dataset, 'fallback_coordinates_suffix', coordinates_suffix)
+    
     # Pseudo-label configuration
     use_pseudo_labels = getattr(cfg.dataset, 'use_pseudo_labels', False)
     pseudo_label_dir = getattr(cfg.dataset, 'pseudo_label_dir', None)
-    pseudo_label_binary_mode = getattr(cfg.dataset, 'pseudo_label_binary_mode', True)
-    pseudo_label_selection_strategy = getattr(cfg.dataset, 'pseudo_label_selection_strategy', 'percentile')
+    binary_mode = getattr(cfg.dataset, 'binary_mode', True)
+    prototype_selection_strategy = getattr(cfg.dataset, 'prototype_selection_strategy', 'percentile')
     pseudo_label_confidence_threshold = getattr(cfg.dataset, 'pseudo_label_confidence_threshold', 0.85)
-    pseudo_label_min_patches = getattr(cfg.dataset, 'pseudo_label_min_patches', 5)
+    prototype_min_patches = getattr(cfg.dataset, 'prototype_min_patches', 5)
     
     # Per-class thresholds (optional) - can be list [class0_thresh, class1_thresh, ...] or dict {0: thresh0, 1: thresh1}
-    pseudo_label_per_class_thresholds = getattr(cfg.dataset, 'pseudo_label_per_class_thresholds', None)
+    threshold_for_prototype = getattr(cfg.dataset, 'threshold_for_prototype', None)
     # Convert OmegaConf containers to native Python types
-    if pseudo_label_per_class_thresholds is not None:
-        pseudo_label_per_class_thresholds = OmegaConf.to_container(pseudo_label_per_class_thresholds, resolve=True)
+    if threshold_for_prototype is not None:
+        threshold_for_prototype = OmegaConf.to_container(threshold_for_prototype, resolve=True)
     
     # Classes that require pseudo-labels (e.g., [1] for tumor only, None for all classes)
     # For benign slides, we don't need pseudo-labels as all patches are class 0
-    pseudo_label_required_classes = getattr(cfg.dataset, 'pseudo_label_required_classes', None)
-    if pseudo_label_required_classes is not None:
-        pseudo_label_required_classes = OmegaConf.to_container(pseudo_label_required_classes, resolve=True)
+    prototype_label_required_classes = getattr(cfg.dataset, 'prototype_label_required_classes', None)
+    if prototype_label_required_classes is not None:
+        prototype_label_required_classes = OmegaConf.to_container(prototype_label_required_classes, resolve=True)
     
     # Output directory
     work_dir = Path(cfg.work_dir)
@@ -417,52 +460,52 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
     pseudo_loader = None
     pseudo_selector = None
     if use_pseudo_labels and pseudo_label_dir:
-        print(f"\n=== Pseudo-Label Configuration ===")
-        print(f"Pseudo-label directory: {pseudo_label_dir}")
-        print(f"Binary mode: {pseudo_label_binary_mode}")
-        print(f"Selection strategy: {pseudo_label_selection_strategy}")
+        print(f"\n=== Attention Score Configuration ===")
+        print(f"Attention scores directory: {pseudo_label_dir}")
+        print(f"Binary mode: {binary_mode}")
+        print(f"Selection strategy: {prototype_selection_strategy}")
         
         # Display threshold configuration
-        if pseudo_label_per_class_thresholds is not None:
+        if threshold_for_prototype is not None:
             print(f"Per-class confidence thresholds:")
-            if isinstance(pseudo_label_per_class_thresholds, dict):
-                for class_id, thresh in pseudo_label_per_class_thresholds.items():
+            if isinstance(threshold_for_prototype, dict):
+                for class_id, thresh in threshold_for_prototype.items():
                     class_name = class_order[class_id] if class_id < len(class_order) else f"class_{class_id}"
                     print(f"  {class_name}: {thresh}")
-            elif isinstance(pseudo_label_per_class_thresholds, (list, tuple)):
-                for class_id, thresh in enumerate(pseudo_label_per_class_thresholds):
+            elif isinstance(threshold_for_prototype, (list, tuple)):
+                for class_id, thresh in enumerate(threshold_for_prototype):
                     class_name = class_order[class_id] if class_id < len(class_order) else f"class_{class_id}"
                     print(f"  {class_name}: {thresh}")
         else:
             print(f"Confidence threshold (global): {pseudo_label_confidence_threshold}")
         
-        print(f"Min patches per WSI: {pseudo_label_min_patches}")
+        print(f"Min patches per WSI: {prototype_min_patches}")
         
-        if pseudo_label_required_classes is not None:
-            required_class_names = [class_order[c] if c < len(class_order) else f"class_{c}" for c in pseudo_label_required_classes]
-            print(f"Pseudo-labels required only for: {required_class_names}")
-            other_classes = [i for i in range(len(class_order)) if i not in pseudo_label_required_classes]
+        if prototype_label_required_classes is not None:
+            required_class_names = [class_order[c] if c < len(class_order) else f"class_{c}" for c in prototype_label_required_classes]
+            print(f"Attention scores required only for: {required_class_names}")
+            other_classes = [i for i in range(len(class_order)) if i not in prototype_label_required_classes]
             if other_classes:
                 other_class_names = [class_order[c] if c < len(class_order) else f"class_{c}" for c in other_classes]
                 print(f"Random sampling for: {other_class_names}")
         else:
-            print(f"Pseudo-labels required for all classes")
+            print(f"Attention scores required for all classes")
         
         try:
             pseudo_loader = PseudoLabelLoader(
                 pseudo_label_dir=pseudo_label_dir,
-                binary_mode=pseudo_label_binary_mode,
+                binary_mode=binary_mode,
                 num_classes=len(class_order)
             )
             pseudo_selector = PatchSelector(
                 num_classes=len(class_order),
-                selection_strategy=pseudo_label_selection_strategy
+                selection_strategy=prototype_selection_strategy
             )
-            print(f"✓ Pseudo-label loader initialized")
+            print(f"✓ Attention score loader initialized")
         except Exception as e:
-            print(f"Warning: Failed to initialize pseudo-label loader: {e}")
-            print(f"Falling back to random patch sampling")
-            use_pseudo_labels = False
+            print(f"✗ Error: Failed to initialize attention score loader: {e}")
+            print(f"  Make sure attention score files exist in: {pseudo_label_dir}")
+            raise
     
     proto_coords_dir.mkdir(parents=True, exist_ok=True)
     
@@ -509,6 +552,52 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
     for i, class_name in enumerate(class_order):
         print(f"  {class_name}: {len(files_by_class[i])} files")
     
+    # Filter out files without pseudo-labels (attention scores) if required
+    if use_pseudo_labels and pseudo_label_dir:
+        print(f"\nFiltering files based on pseudo-label availability...")
+        files_by_class_filtered = {i: [] for i in range(len(class_order))}
+        total_excluded = 0
+        
+        for class_idx, class_name in enumerate(class_order):
+            # Check if this class requires pseudo-labels
+            class_needs_pseudo_labels = True
+            if prototype_label_required_classes is not None:
+                class_needs_pseudo_labels = class_idx in prototype_label_required_classes
+            
+            if not class_needs_pseudo_labels:
+                # Keep all files for classes that don't need pseudo-labels
+                files_by_class_filtered[class_idx] = files_by_class[class_idx]
+                print(f"  {class_name}: Keeping all {len(files_by_class[class_idx])} files (pseudo-labels not required)")
+                continue
+            
+            # Filter files with pseudo-labels
+            for base_key in files_by_class[class_idx]:
+                # Check if pseudo-label file exists
+                pseudo_label_extensions = ['.pt', '.pth', '.npy', '.npz', '.pkl']
+                pseudo_label_found = False
+                
+                for ext in pseudo_label_extensions:
+                    pseudo_label_path = os.path.join(pseudo_label_dir, base_key + ext)
+                    if os.path.exists(pseudo_label_path):
+                        pseudo_label_found = True
+                        break
+                
+                if pseudo_label_found:
+                    files_by_class_filtered[class_idx].append(base_key)
+                else:
+                    total_excluded += 1
+            
+            excluded_count = len(files_by_class[class_idx]) - len(files_by_class_filtered[class_idx])
+            print(f"  {class_name}: {len(files_by_class_filtered[class_idx])}/{len(files_by_class[class_idx])} files (excluded {excluded_count} without pseudo-labels)")
+        
+        files_by_class = files_by_class_filtered
+        if total_excluded > 0:
+            print(f"\n  ⚠ Total excluded: {total_excluded} files without pseudo-labels")
+    
+    # Debug: Show sample files for first class
+    if files_by_class.get(0) and len(files_by_class[0]) > 0:
+        print(f"\nSample files for {class_order[0]}: {files_by_class[0][:3]}")
+    
     # Generate UID early to check if coordinates already exist
     # For UID generation, we need to know which files would be used
     # Shuffle files with same seed for consistency
@@ -517,26 +606,16 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
         files = files_by_class[class_idx].copy()
         # Shuffle with same seed to get deterministic file selection
         random.Random(seed).shuffle(files)
-        files_by_class_for_uid[class_idx] = files[:num_wsis_per_class]
+        files_by_class_for_uid[class_idx] = files[:n_slides_per_class_for_prototypes]
     
     # Combine all expected files for UID
     expected_base_keys = []
     for class_idx, class_name in enumerate(class_order):
         expected_base_keys.extend(files_by_class_for_uid[class_idx])
     
-    # Prepare pseudo-label config for UID
-    pseudo_config = None
-    if use_pseudo_labels:
-        pseudo_config = {
-            'strategy': pseudo_label_selection_strategy,
-            'threshold': pseudo_label_confidence_threshold,
-        }
-    
-    # Generate UID (deterministic based on configuration)
-    expected_uid = generate_coordinates_uid(
-        num_per_wsi, num_wsis_per_class, expected_base_keys,
-        use_pseudo_labels, pseudo_config
-    )
+    # Generate UID from config (deterministic, only once per run)
+    expected_uid = build_uid_from_config(cfg)
+    # Never concatenate or interpolate UID into itself; only use this value
     
     # Check if coordinates with this UID already exist
     existing_coords = True
@@ -556,11 +635,7 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
                 data = np.load(coord_file, allow_pickle=True)
                 print(f"    {class_name}: {len(data)} coordinates from {coord_file.name}")
         
-        # Save UID to latest_uid.txt for downstream use
-        uid_file = proto_coords_dir / "latest_uid.txt"
-        with open(uid_file, 'w') as f:
-            f.write(expected_uid)
-        print(f"\n✓ Run UID saved to: {uid_file}")
+        # No longer saving UID to latest_uid.txt
         print(f"  Skipping to next pipeline step...")
         return
     
@@ -581,27 +656,88 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
         # Shuffle for diversity (seed already set at function start)
         random.shuffle(files)
         
+        # Debug: Check first few files
+        files_found = 0
+        files_missing_wsi = 0
+        files_missing_coord = 0
+        
+        print(f"  Checking files (showing first 5):")
+        for idx, base_key in enumerate(files[:5]):
+            wsi_path = find_wsi_file(wsi_dir, base_key)
+            if not wsi_path and fallback_wsi_dir:
+                wsi_path = find_wsi_file(fallback_wsi_dir, base_key)
+
+            coord_path = find_coordinate_file(coordinates_dir, base_key, coordinates_suffix)
+            if not coord_path and fallback_coordinates_dir:
+                coord_path = find_coordinate_file(fallback_coordinates_dir, base_key, fallback_coordinates_suffix)
+            
+            wsi_exists = wsi_path is not None
+            coord_exists = coord_path is not None
+            
+            status = "✓" if (wsi_exists and coord_exists) else "✗"
+            wsi_info = os.path.basename(wsi_path) if wsi_path else "NOT FOUND"
+            coord_info = os.path.basename(coord_path) if coord_path else "NOT FOUND"
+            if not wsi_exists and fallback_wsi_dir:
+                wsi_info += f" (checked fallback: {fallback_wsi_dir})"
+            if not coord_exists and fallback_coordinates_dir:
+                coord_info += f" (checked fallback: {fallback_coordinates_dir})"
+            print(f"    {status} {base_key}:")
+            print(f"       WSI: {wsi_info}")
+            print(f"       Coord: {coord_info}")
+            
+            if not wsi_exists:
+                files_missing_wsi += 1
+            if not coord_exists:
+                files_missing_coord += 1
+            if wsi_exists and coord_exists:
+                files_found += 1
+        
+        # Quick scan of all files
+        total_valid = 0
+        for base_key in files:
+            wsi_path = find_wsi_file(wsi_dir, base_key)
+            if not wsi_path and fallback_wsi_dir:
+                wsi_path = find_wsi_file(fallback_wsi_dir, base_key)
+
+            coord_path = find_coordinate_file(coordinates_dir, base_key, coordinates_suffix)
+            if not coord_path and fallback_coordinates_dir:
+                coord_path = find_coordinate_file(fallback_coordinates_dir, base_key, fallback_coordinates_suffix)
+            
+            if wsi_path and coord_path:
+                total_valid += 1
+        
+        print(f"  Total files with both WSI and coordinates: {total_valid}/{len(files)}")
+        
+        if total_valid == 0:
+            print(f"  ⚠ WARNING: No valid files found for {class_name}!")
+            print(f"    Check that files exist in:")
+            print(f"      WSI dir: {wsi_dir}")
+            print(f"      Coord dir: {coordinates_dir}")
+            continue
+        
         # Create progress bar that tracks WSIs processed
-        with tqdm(total=min(num_wsis_per_class, len(files)), desc=f"{class_name} WSIs", unit="wsi") as pbar_wsi:
+        with tqdm(total=min(n_slides_per_class_for_prototypes, len(files)), desc=f"{class_name} WSIs", unit="wsi") as pbar_wsi:
             for base_key in files:
-                if wsis_processed_per_class[class_name] >= num_wsis_per_class:
+                if wsis_processed_per_class[class_name] >= n_slides_per_class_for_prototypes:
                     break
                 
-                # Paths
-                wsi_path = os.path.join(wsi_dir, base_key + ".tif")
+                # Find files with any extension
+                wsi_path = find_wsi_file(wsi_dir, base_key)
+                if not wsi_path and fallback_wsi_dir:
+                    wsi_path = find_wsi_file(fallback_wsi_dir, base_key)
+
+                coord_path = find_coordinate_file(coordinates_dir, base_key, coordinates_suffix)
+                if not coord_path and fallback_coordinates_dir:
+                    # Use fallback coordinates
+                    coord_path = find_coordinate_file(fallback_coordinates_dir, base_key, fallback_coordinates_suffix)
                 
-                # Handle h5 file naming convention: files have _patches.h5 suffix
-                if coordinates_suffix == '.h5':
-                    coord_path = os.path.join(coordinates_dir, base_key + "_patches" + coordinates_suffix)
-                else:
-                    coord_path = os.path.join(coordinates_dir, base_key + coordinates_suffix)
-                
-                if not os.path.exists(wsi_path) or not os.path.exists(coord_path):
+                if not wsi_path or not coord_path:
                     continue
                 
-                # Load coordinates
+                # Load coordinates (detect suffix from actual file found)
                 try:
-                    coords_x, coords_y = load_coordinates(coord_path, coordinates_suffix)
+                    detected_suffix = os.path.splitext(coord_path)[1]
+                    coords_x, coords_y = load_coordinates(coord_path, detected_suffix)
                 except Exception as e:
                     print(f"  Error loading coordinates from {coord_path}: {e}")
                     continue
@@ -611,9 +747,9 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
                 
                 # Determine if this class requires pseudo-labels
                 class_needs_pseudo_labels = use_pseudo_labels and pseudo_loader is not None
-                if pseudo_label_required_classes is not None:
+                if prototype_label_required_classes is not None:
                     # Only use pseudo-labels for specified classes
-                    class_needs_pseudo_labels = class_needs_pseudo_labels and (class_idx in pseudo_label_required_classes)
+                    class_needs_pseudo_labels = class_needs_pseudo_labels and (class_idx in prototype_label_required_classes)
                 
                 # Extract patches using pseudo-labels or random sampling
                 if class_needs_pseudo_labels:
@@ -621,47 +757,160 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
                         # Load pseudo-label attention scores for this WSI
                         scores = pseudo_loader.load_wsi_scores(base_key)
                         print()
-                        # Verify scores match coordinate count
+                        # Verify scores match coordinate count, attempt to align if mismatch
                         if len(scores) != len(coords_x):
-                            print(f"  Warning: Pseudo-label count ({len(scores)}) != coordinate count ({len(coords_x)}) for {base_key}")
-                            print(f"  Skipping this WSI")
-                            continue
+                            if pseudo_label_coord_dir:
+                                pseudo_coord_path = os.path.join(pseudo_label_coord_dir, base_key + pseudo_label_coord_suffix)
+                                if os.path.exists(pseudo_coord_path):
+                                    try:
+                                        pseudo_x, pseudo_y = load_coordinates(pseudo_coord_path, pseudo_label_coord_suffix)
+                                        idx_main, idx_pseudo = _match_coordinates(coords_x, coords_y, pseudo_x, pseudo_y)
+                                        if len(idx_main) == 0:
+                                            print(f"  Warning: No overlapping coordinates between dataset and pseudo-label coords for {base_key}")
+                                            print(f"  Skipping this WSI")
+                                            continue
+                                        # Subset to overlapping coordinates
+                                        coords_x = coords_x[idx_main]
+                                        coords_y = coords_y[idx_main]
+                                        if scores.dim() == 1:
+                                            scores = scores[idx_pseudo]
+                                        else:
+                                            scores = scores[idx_pseudo, :]
+                                        print(f"  Aligned pseudo-labels to coordinates: {len(idx_main)} overlaps (coords {len(coords_x)}, pseudo {len(scores)})")
+                                    except Exception as e:
+                                        print(f"  Warning: Failed to align pseudo-label coords for {base_key}: {e}")
+                                        print(f"  Skipping this WSI")
+                                        continue
+                                else:
+                                    print(f"  Warning: Pseudo-label coord file missing for {base_key}: {pseudo_coord_path}")
+                                    print(f"  Skipping this WSI")
+                                    continue
+                            else:
+                                print(f"  Warning: Pseudo-label count ({len(scores)}) != coordinate count ({len(coords_x)}) for {base_key}")
+                                print(f"  Provide pseudo_label_coordinates_dir to align; skipping this WSI")
+                                continue
                         
-                        # Select high-confidence patches based on attention scores
-                        # Use per-class thresholds if provided, otherwise use global threshold
-                        threshold = pseudo_label_per_class_thresholds if pseudo_label_per_class_thresholds is not None else pseudo_label_confidence_threshold
+                        # IMPORTANT: Normalize attention scores per slide (min-max scaling)
+                        # This ensures consistent prototype selection across slides
+                        if scores.dim() == 1:
+                            s_min = scores.min()
+                            s_max = scores.max()
+                            if (s_max - s_min) > 1e-8:
+                                scores = (scores - s_min) / (s_max - s_min)
+                            else:
+                                scores = torch.zeros_like(scores)
+                        elif scores.dim() == 2:
+                            # Normalize per class independently
+                            mins = scores.min(dim=0, keepdim=True)[0]
+                            maxs = scores.max(dim=0, keepdim=True)[0]
+                            denom = (maxs - mins)
+                            denom[denom == 0] = 1.0
+                            scores = (scores - mins) / denom
                         
-                        selection_mask = pseudo_selector.select_patches(
-                            scores,
-                            confidence_threshold=threshold,
-                            target_class=class_idx,  # Only check threshold for current class
-                            binary_mode=pseudo_label_binary_mode
-                        )
+                        # Binary mode: special handling for negative class (benign)
+                        # Negative class needs both high-tumor and low-no-tumor patches for robust prototypes
+                        if binary_mode and class_idx == 0:
+                            # For negative class (benign):
+                            # 1. Select top n-percentile patches with HIGHEST tumor score (dim 1) - these are false positives
+                            # 2. Select top n-percentile patches with LOWEST no-tumor score (dim 0) - these are ambiguous
+                            # These will be clustered together to form robust negative prototypes
+                            
+                            if scores.dim() == 1:
+                                # Convert binary scores to 2D: [1-score, score]
+                                scores_2d = torch.stack([1 - scores, scores], dim=1)
+                            else:
+                                scores_2d = scores
+                            
+                            tumor_scores = scores_2d[:, 1].numpy()  # Higher = more tumor-like
+                            no_tumor_scores = scores_2d[:, 0].numpy()  # Higher = more benign-like
+                            
+                            # Threshold for selection
+                            threshold = threshold_for_prototype if threshold_for_prototype is not None else pseudo_label_confidence_threshold
+                            if isinstance(threshold, dict):
+                                thresh_val = threshold.get(class_idx, 0.85)
+                            elif isinstance(threshold, (list, tuple)):
+                                thresh_val = threshold[class_idx]
+                            else:
+                                thresh_val = threshold
+                            
+                            # Select high tumor score patches (false positives for negative class)
+                            tumor_threshold = np.quantile(tumor_scores, thresh_val)
+                            high_tumor_indices = np.where(tumor_scores >= tumor_threshold)[0]
+                            
+                            # Select low no-tumor score patches (ambiguous patches)
+                            low_notumor_threshold = np.quantile(no_tumor_scores, 1 - thresh_val)
+                            low_notumor_indices = np.where(no_tumor_scores <= low_notumor_threshold)[0]
+                            
+                            # Combine both sets (union)
+                            high_conf_indices = np.unique(np.concatenate([high_tumor_indices, low_notumor_indices]))
+                            
+                            print(f"  Negative class selection: {len(high_tumor_indices)} high-tumor + {len(low_notumor_indices)} low-no-tumor = {len(high_conf_indices)} total")
                         
-                        high_conf_indices = np.where(selection_mask)[0]
+                        elif binary_mode and class_idx == 1:
+                            # For positive class (tumor): select top n-percentile with highest tumor score
+                            if scores.dim() == 1:
+                                tumor_scores = scores.numpy()
+                            else:
+                                tumor_scores = scores[:, 1].numpy()
+                            
+                            threshold = threshold_for_prototype if threshold_for_prototype is not None else pseudo_label_confidence_threshold
+                            if isinstance(threshold, dict):
+                                thresh_val = threshold.get(class_idx, 0.995)
+                            elif isinstance(threshold, (list, tuple)):
+                                thresh_val = threshold[class_idx]
+                            else:
+                                thresh_val = threshold
+                            
+                            tumor_threshold = np.quantile(tumor_scores, thresh_val)
+                            high_conf_indices = np.where(tumor_scores >= tumor_threshold)[0]
+                            
+                            print(f"  Positive class selection: {len(high_conf_indices)} high-tumor patches")
+                        
+                        else:
+                            # Multi-class mode: select top n-percentile for this class
+                            if scores.dim() == 1:
+                                class_scores = scores.numpy()
+                            else:
+                                class_scores = scores[:, class_idx].numpy()
+                            
+                            threshold = threshold_for_prototype if threshold_for_prototype is not None else pseudo_label_confidence_threshold
+                            if isinstance(threshold, dict):
+                                thresh_val = threshold.get(class_idx, 0.85)
+                            elif isinstance(threshold, (list, tuple)):
+                                thresh_val = threshold[class_idx]
+                            else:
+                                thresh_val = threshold
+                            
+                            class_threshold = np.quantile(class_scores, thresh_val)
+                            high_conf_indices = np.where(class_scores >= class_threshold)[0]
+                            
+                            print(f"  Class {class_idx} selection: {len(high_conf_indices)} high-confidence patches")
                         
                         # Check minimum patch requirement
-                        if len(high_conf_indices) < pseudo_label_min_patches:
-                            print(f"  Warning: Only {len(high_conf_indices)} high-conf patches (< {pseudo_label_min_patches} min) for {base_key}")
+                        if len(high_conf_indices) < prototype_min_patches:
+                            print(f"  Warning: Only {len(high_conf_indices)} high-conf patches (< {prototype_min_patches} min) for {base_key}")
                             print(f"  Skipping this WSI")
                             continue
                         
-                        # Limit to num_per_wsi if we have more than needed
-                        if len(high_conf_indices) > num_per_wsi:
-                            sampled_indices = np.random.choice(high_conf_indices, num_per_wsi, replace=False)
-                        else:
-                            sampled_indices = high_conf_indices
+                        # Use all high-confidence patches selected by percentile threshold
+                        sampled_indices = high_conf_indices
                         
-                        print(f"  Selected {len(sampled_indices)} high-confidence patches from {len(coords_x)} (top {(len(high_conf_indices)/len(coords_x)*100):.1f}%)")
+                        print(f"  Selected {len(sampled_indices)} patches from {len(coords_x)} (top {(len(high_conf_indices)/len(coords_x)*100):.1f}%)")
                     except Exception as e:
                         print(f"  Warning: Error loading pseudo-labels for {base_key}: {e}")
                         print(f"  Skipping this WSI")
                         continue
                 else:
-                    # Random sampling (original behavior)
-                    n_samples = min(num_per_wsi, len(coords_x))
-                    print(f"  Sampling {n_samples} random patches from {len(coords_x)}")
-                    sampled_indices = np.random.choice(len(coords_x), n_samples, replace=False)
+                    # For classes without pseudo-labels (e.g., benign), use a subset of coordinates
+                    # Limit to 10,000 patches per slide to avoid massive coordinate files
+                    n_total = len(coords_x)
+                    limit = 10000
+                    if n_total > limit:
+                        sampled_indices = np.random.choice(n_total, limit, replace=False)
+                        print(f"  Randomly sampled {limit} patches from {n_total} (no pseudo-label filtering)")
+                    else:
+                        sampled_indices = np.arange(n_total)
+                        print(f"  Using all {n_total} coordinates (no pseudo-label filtering)")
                 
                 # Store coordinates (patches extracted on-the-fly when needed)
                 for idx in sampled_indices:
@@ -697,13 +946,8 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
             print(f"Saved {class_name} prototype coordinates to {coord_save_path}")
             print(f"  UID: {uid}")
     
-    # Save UID to config file for downstream use
-    uid_file = proto_coords_dir / "latest_uid.txt"
-    if uid:  # Save the last generated UID
-        with open(uid_file, 'w') as f:
-            f.write(uid)
-        print(f"\n✓ Run UID saved to: {uid_file}")
-        print(f"  This UID will be used for all downstream outputs (features, checkpoints, etc.)")
+    # No longer saving UID to latest_uid.txt
+    # UID is only used for directory naming and config
     
     print("\n=== Coordinate Extraction Complete ===")
     for class_name in class_order:
@@ -712,29 +956,44 @@ def extract_patches(cfg, num_per_wsi=1000, num_wsis_per_class=20, seed=42):
         print(f"{class_name}: {n_wsis} WSIs → {n_coords} coordinates")
     print(f"\nPrototype coordinates saved to: {proto_coords_dir}")
     print(f"Patches will be extracted on-the-fly during MedCLIP feature extraction.")
-    print(f"\nTo use this run in the pipeline, set: run_uid: {uid}")
-    print(f"Or outputs will be automatically organized under: {work_dir}/runs/{uid}/")
+    print(f"\nExample outputs will be organized under: {work_dir}/runs/{uid}/")
+    # No longer referencing latest_uid.txt
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='Extract prototype coordinates from WSIs using attention scores',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Parameters are now read from config file:
+  - features.n_slides_per_class_for_prototypes: Max WSIs per class
+  - features.selection_method: Patch selection strategy
+  - dataset.threshold_for_prototype: Per-class confidence thresholds
+"""
+    )
     parser.add_argument('--config', type=str, required=True, help='Path to YAML config')
-    parser.add_argument('--num_per_wsi', type=int, default=1000, 
-                       help='Max number of patches per WSI')
-    parser.add_argument('--num_wsis_per_class', type=int, default=20,
-                       help='Max number of WSIs to process per class')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
     parser.add_argument('--generate_thumbnails', action='store_true',
                        help='Generate test set thumbnails')
     parser.add_argument('--num_thumbnail_samples', type=int, default=5,
                        help='Number of test samples for thumbnail generation')
+    parser.add_argument('--pseudo_label_coordinates_dir', type=str, default=None,
+                        help='Directory with coordinates corresponding to attention scores (used to align when counts mismatch)')
+    parser.add_argument('--pseudo_label_coordinates_suffix', type=str, default=None,
+                        help='File suffix/extension for pseudo-label coordinate files (default: coordinates_suffix)')
     args = parser.parse_args()
     
     cfg = OmegaConf.load(args.config)
+
+    # Allow overriding pseudo-label coordinate paths via CLI
+    if args.pseudo_label_coordinates_dir:
+        cfg.dataset.pseudo_label_coordinates_dir = args.pseudo_label_coordinates_dir
+    if args.pseudo_label_coordinates_suffix:
+        cfg.dataset.pseudo_label_coordinates_suffix = args.pseudo_label_coordinates_suffix
     
-    # Extract patches from training set
-    extract_patches(cfg, args.num_per_wsi, args.num_wsis_per_class, seed=args.seed)
+    # Extract patches from training set (parameters read from config)
+    extract_patches(cfg, seed=args.seed)
     
     # Generate test thumbnails if requested
     if args.generate_thumbnails:

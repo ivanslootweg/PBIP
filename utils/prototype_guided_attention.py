@@ -185,6 +185,55 @@ class PrototypeGuidedAttention(nn.Module):
         if attention_type not in ['cosine_sim', 'softmax', 'mean']:
             raise ValueError(f"Unknown attention type: {attention_type}")
     
+    def compute_match_scores(self, patch_features: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-patch per-class match scores using prototypes.
+        Returns tensor of shape (num_patches, num_classes) with values roughly in [-1,1].
+        """
+        # Normalize patch features
+        patch_features_norm = normalize_features(patch_features)
+        all_prototypes = self.prototype_bank.get_all_prototypes()
+        num_patches = patch_features.shape[0]
+        device = patch_features.device
+        match_scores = []
+        for class_id in range(self.num_classes):
+            class_prototypes = all_prototypes[class_id]
+            if len(class_prototypes) == 0:
+                match_scores.append(torch.zeros((num_patches,), device=device))
+            else:
+                sims = torch.mm(patch_features_norm, class_prototypes.t())  # (n_patches, n_proto)
+                # Use max similarity as representative score
+                score, _ = torch.max(sims, dim=1)
+                match_scores.append(score)
+        # Stack to (n_patches, num_classes)
+        match_scores = torch.stack(match_scores, dim=1)
+        return match_scores
+
+    def combine_with_raw_attention(self, match_scores: torch.Tensor, raw_attention: torch.Tensor) -> torch.Tensor:
+        """
+        Combine prototype match scores with raw MIL attention per user formula:
+            Final_Segmentation_i = Softmax(S_match(f_i) + A_raw_i)
+        - match_scores: (n_patches, num_classes) (values in approx [-1,1])
+        - raw_attention: either (n_patches,) for binary or (n_patches, num_classes)
+        Returns softmax probabilities per patch: (n_patches, num_classes)
+        """
+        # Ensure shapes
+        if raw_attention.dim() == 1:
+            # binary mode: convert to two-channel [1-score, score]
+            a = raw_attention.unsqueeze(1)
+            raw = torch.cat([1.0 - a, a], dim=1)
+        else:
+            raw = raw_attention
+        # If match_scores are on CPU and raw on CPU, ensure same dtype
+        raw = raw.to(match_scores.device).float()
+
+        # Scale match_scores from [-1,1] -> [0,1] to reduce dominance of cosine if wanted
+        # keep raw cosine for now (user suggested direct addition). We simply align shapes.
+        # Apply softmax across classes to get final probabilities
+        combined = match_scores + raw
+        probs = F.softmax(combined, dim=1)
+        return probs
+    
     def forward(
         self,
         patch_features: torch.Tensor,

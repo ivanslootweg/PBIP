@@ -1,3 +1,16 @@
+"""
+DEPRECATED: Foreground/background feature extraction and mask adaptation utilities.
+
+These classes are no longer used in the feature-based training pipeline:
+- MaskAdapter_DynamicThreshold
+- FeatureExtractor
+
+They were designed for pixel-level PBIP training with multi-scale CAM generation.
+The new feature-based pipeline loads precomputed patch features directly.
+
+MIGRATION: Use datasets/feature_dataset.py FeatureWSIDataset for the new pipeline.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,8 +29,10 @@ class MaskAdapter_DynamicThreshold(nn.Module):
         self.alpha = alpha
         self.mask_cam = mask_cam
 
-        print(f"MaskAdapter_DynamicThreshold:")
+        print(f"MaskAdapter_DynamicThreshold (DEPRECATED):")
+        print(f"  This class is no longer used in the feature-based training pipeline.")
         print(f"  alpha: {alpha}")
+
         print(f"  mask_cam: {mask_cam}")
 
     def forward(self, x):

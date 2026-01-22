@@ -62,18 +62,23 @@ def check_prototypes(cfg):
     
     return prototypes_ready
 
-def check_medclip_features(cfg):
-    """Check if MedCLIP features were extracted."""
-    print("\n=== MEDCLIP FEATURES CHECK ===")
+def check_patch_features(cfg):
+    """Check if PATCH features were extracted."""
+    print("\n=== PATCH FEATURES CHECK ===")
     features_dir = Path(cfg.features.save_dir)
-    medclip_pkl = features_dir / cfg.features.medclip_features_pkl
+    # Allow different encoder names in filename (PATCH token replaced)
+    encoder_name = getattr(cfg.model, 'patch_encoder', 'medclip')
+    medclip_filename = cfg.features.features_for_prototype_clusters
+    if encoder_name.lower().strip() != 'medclip':
+        medclip_filename = medclip_filename.replace('medclip', encoder_name)
+    medclip_pkl = features_dir / medclip_filename
     label_feature_pkl = features_dir / cfg.features.label_feature_pkl
     
     medclip_ready = False
     clustering_ready = False
     
     if medclip_pkl.exists():
-        print(f"✓ MedCLIP features file exists: {medclip_pkl.name}")
+        print(f"✓ Features file exists: {medclip_pkl.name}")
         # Try to load and check
         import pickle
         try:
@@ -88,7 +93,7 @@ def check_medclip_features(cfg):
         except Exception as e:
             print(f"  ⚠ Could not load: {e}")
     else:
-        print(f"✗ MedCLIP features file NOT FOUND: {medclip_pkl}")
+        print(f"✗ Features file NOT FOUND: {medclip_pkl}")
     
     if label_feature_pkl.exists():
         print(f"✓ Label features (clustered) file exists: {label_feature_pkl.name}")
@@ -139,7 +144,7 @@ def main():
     print("=" * 80)
     
     prototypes_ready = check_prototypes(cfg)
-    medclip_ready, clustering_ready = check_medclip_features(cfg)
+    medclip_ready, clustering_ready = check_patch_features(cfg)
     check_training_setup(cfg)
     
     print("\n" + "=" * 80)
@@ -152,8 +157,8 @@ def main():
     if not medclip_ready:
         steps_todo.append({
             'num': len(steps_todo) + 1,
-            'name': 'Extract MedCLIP features',
-            'cmd': 'python3 features/excract_medclip_proces.py --config work_dirs/custom_wsi_template.yaml'
+            'name': 'Extract patch features',
+            'cmd': 'python3 features/extract_patch_features.py --config work_dirs/custom_wsi_template.yaml'
         })
     
     if not clustering_ready:
@@ -166,8 +171,8 @@ def main():
     if clustering_ready:
         steps_todo.append({
             'num': len(steps_todo) + 1,
-            'name': 'Train segmentation model',
-            'cmd': 'python3 train_stage_1.py --config work_dirs/custom_wsi_template.yaml --gpu 0'
+            'name': 'Train patch refinement model',
+            'cmd': 'python3 train_patch_refinement.py --config work_dirs/custom_wsi_template.yaml --gpu 0'
         })
     
     if steps_todo:

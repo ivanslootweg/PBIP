@@ -1,4 +1,24 @@
 """
+DEPRECATED: WSI dataset classes for pixel-extraction-based PBIP training.
+
+These classes are no longer used in the feature-based patch refinement pipeline.
+They were designed for extracting patches on-the-fly from raw WSI files during training.
+
+NEW APPROACH:
+The current pipeline uses precomputed patch features (from encoders like MedCLIP, Virchow2, DinoV3)
+loaded via FeatureWSIDataset (datasets/feature_dataset.py). This eliminates the need for:
+- On-the-fly patch extraction from WSI files
+- Pixel-level segmentation predictions
+- Multi-scale CAM generation
+
+MIGRATION GUIDE:
+1. Ensure patch_features_dir is set in your config (e.g., /path/to/virchow2_features/)
+2. Use datasets/feature_dataset.py FeatureWSIDataset instead
+3. Update config: use_feature_based_training: true (or set patch_features_dir)
+4. Load precomputed attention scores (pseudo-labels) from pseudo_label_dir
+
+If you need to use the old pixel-extraction-based approach, please refer to an earlier commit.
+
 WSI (Whole Slide Image) dataset classes for weak supervision learning with MedCLIP.
 
 Follows slide2vec pattern: coordinates stored with metadata (tile_level, tile_size, spacing).
@@ -238,7 +258,7 @@ class CustomWSIPatchTestDataset(Dataset):
         coordinates_dir: str,
         split_csv: str,
         gt_dir: str,
-        split: str = "valid",
+        split: str = "val",
         class_labels_dict: Optional[Dict] = None,
         num_classes: int = 4,
         patch_size: int = 224,
@@ -587,12 +607,12 @@ class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDatase
     Args:
         use_pseudo_labels: Whether to enable pseudo-label filtering
         pseudo_label_dir: Directory containing .pt files with attention scores
-        pseudo_label_binary_mode: If True, interpret scores as binary (low/high). 
+        binary_mode: If True, interpret scores as binary (low/high). 
                                   If False, multi-class (one score per class)
-        pseudo_label_selection_strategy: Strategy for selecting patches ('percentile', 
+        prototype_selection_strategy: Strategy for selecting patches ('percentile', 
                                         'threshold', 'entropy', 'margin')
         pseudo_label_confidence_threshold: Confidence threshold for selection
-        pseudo_label_min_patches: Minimum selected patches per WSI to be usable
+        prototype_min_patches: Minimum selected patches per WSI to be usable
         ... (other CustomWSIPatchTrainingDataset arguments)
     """
     
@@ -612,11 +632,11 @@ class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDatase
         # Pseudo-label specific arguments
         use_pseudo_labels: bool = True,
         pseudo_label_dir: Optional[str] = None,
-        pseudo_label_binary_mode: bool = True,
-        pseudo_label_selection_strategy: str = 'percentile',
+        binary_mode: bool = True,
+        prototype_selection_strategy: str = 'percentile',
         pseudo_label_confidence_threshold: float = 0.85,
-        pseudo_label_min_patches: int = 5,
-        pseudo_label_analyze: bool = True,
+        prototype_min_patches: int = 5,
+        prototype_label_analyze: bool = True,
     ):
         super().__init__(
             wsi_dir=wsi_dir,
@@ -634,27 +654,27 @@ class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDatase
         
         self.use_pseudo_labels = use_pseudo_labels
         self.pseudo_label_dir = pseudo_label_dir
-        self.pseudo_label_binary_mode = pseudo_label_binary_mode
-        self.pseudo_label_selection_strategy = pseudo_label_selection_strategy
+        self.binary_mode = binary_mode
+        self.prototype_selection_strategy = prototype_selection_strategy
         self.pseudo_label_confidence_threshold = pseudo_label_confidence_threshold
-        self.pseudo_label_min_patches = pseudo_label_min_patches
+        self.prototype_min_patches = prototype_min_patches
         
         # Initialize pseudo-label components if enabled
         if self.use_pseudo_labels and pseudo_label_dir:
             try:
                 self.pseudo_label_loader = PseudoLabelLoader(
                     pseudo_label_dir=pseudo_label_dir,
-                    binary_mode=pseudo_label_binary_mode,
+                    binary_mode=binary_mode,
                     num_classes=num_classes,
                 )
                 
                 self.patch_selector = PatchSelector(
                     num_classes=num_classes,
-                    selection_strategy=pseudo_label_selection_strategy,
+                    selection_strategy=prototype_selection_strategy,
                 )
                 
                 # Pre-load and analyze pseudo-labels
-                self._initialize_pseudo_labels(pseudo_label_analyze)
+                self._initialize_pseudo_labels(prototype_label_analyze)
                 
             except Exception as e:
                 print(f"Warning: Failed to initialize pseudo-labels: {e}")
@@ -693,7 +713,7 @@ class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDatase
                 selected_indices = np.where(selected_mask)[0]
                 
                 # Check minimum threshold
-                if len(selected_indices) < self.pseudo_label_min_patches:
+                if len(selected_indices) < self.prototype_min_patches:
                     insufficient_patches.append((wsi_name, len(selected_indices)))
                     self.high_conf_patch_indices[wsi_name] = selected_indices
                 else:
@@ -713,7 +733,7 @@ class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDatase
         
         if insufficient_patches:
             print(f"\n{len(insufficient_patches)} WSIs have insufficient high-confidence patches:")
-            print(f"  (minimum required: {self.pseudo_label_min_patches})")
+            print(f"  (minimum required: {self.prototype_min_patches})")
             for wsi_name, num_patches in insufficient_patches[:5]:
                 print(f"  - {wsi_name}: {num_patches} patches")
         
@@ -725,7 +745,7 @@ class CustomWSIPatchTrainingDatasetWithPseudoLabels(CustomWSIPatchTrainingDatase
                 stats = analyzer.analyze_all_wsis()
                 
                 print(f"\nGlobal Pseudo-Label Statistics:")
-                print(f"  Mode: {'Binary' if self.pseudo_label_binary_mode else 'Multi-class'}")
+                print(f"  Mode: {'Binary' if self.binary_mode else 'Multi-class'}")
                 print(f"  Total WSIs analyzed: {stats['num_wsis']}")
                 
                 if 'global_stats' in stats:

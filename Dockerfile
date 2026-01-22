@@ -11,7 +11,6 @@ RUN pip3 install \
     omegaconf \
     packaging \
     ttach \
-    MedCLIP \
     openslide-python \
     PyYAML \
     h5py \
@@ -19,3 +18,7 @@ RUN pip3 install \
     tokenizers \
     transformers \
     wandb \
+    plotly \
+    scikit-learn \
+    umap-learn \
+    icecream \

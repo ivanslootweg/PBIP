@@ -48,7 +48,7 @@ class BCSSTrainingDataset(Dataset):
 class BCSSTestDataset(Dataset):
     CLASSES = ["TUM", "STR", "LYM", "NEC", "BACK"]
     def __init__(self, img_root="../data/BCSS-WSSS/", split="test", transform=None):
-        assert split in ["test", "valid"], "split must be one of [test, valid]"
+        assert split in ["test", "val"], "split must be one of [test, val]"
         super(BCSSTestDataset, self).__init__()
         self.get_images_and_labels(img_root, split)
         self.transform = transform

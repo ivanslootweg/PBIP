@@ -93,7 +93,7 @@ When `use_pseudo_labels: true`, the dataset loader:
 2. **Selects High-Confidence Patches**
    - Uses `PatchSelector` with configured strategy
    - Applies confidence threshold (default: top 15% by percentile)
-   - Per-WSI selection respects `pseudo_label_min_patches` constraint
+   - Per-WSI selection respects `prototype_min_patches` constraint
 
 3. **Reports Statistics**
    - Number of selected patches per WSI
@@ -116,11 +116,11 @@ dataset:
   pseudo_label_dir: /path/to/attention_scores
   
   # Binary (single channel) or multi-class (multiple channels)
-  pseudo_label_binary_mode: true
+  binary_mode: true
   
   # Patch selection strategy
   # Options: 'percentile' (recommended), 'threshold', 'entropy', 'margin'
-  pseudo_label_selection_strategy: percentile
+  prototype_selection_strategy: percentile
   
   # Selection threshold (meaning depends on strategy)
   # For percentile: 0.85 = select top 15% of patches
@@ -129,10 +129,10 @@ dataset:
   
   # Minimum patches per WSI that must be selected
   # Prevents prototype corruption from low-quality WSIs
-  pseudo_label_min_patches: 5
+  prototype_min_patches: 5
   
   # Whether to print statistics during initialization
-  pseudo_label_analyze: true
+  prototype_label_analyze: true
 ```
 
 ### Selection Strategies Explained
