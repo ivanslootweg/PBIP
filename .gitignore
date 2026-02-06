@@ -1,0 +1,6 @@
+./wandb/*
+**/__pycache__
+.venv
+*venv*/
+*venv*
+wandb/

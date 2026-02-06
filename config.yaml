@@ -1,0 +1,90 @@
+# PBIP Configuration
+
+# Toggle for binary vs multiclass prediction
+# If True, treats 1st score array as Class 1, inverses as Class 0 (or ignores if negative WSI)
+# If False, expects one score array per class
+binary_mode: true
+
+# List of class names (must match the number of classes implied by binary_mode or your attention scores)
+# For binary_mode=True, typically [Negative, Positive] or [Class0, Class1]
+class_names: ["Negative", "Positive"]
+
+# Experiment Name (Used for folder organization)
+# All outputs including features will be saved in: work_dir/experiment_name/features/
+experiment_name: "pbip_experiment_v1"
+
+# Directory to save experiment outputs (features, prototypes, checkpoints, etc.)
+# Results will be saved in: work_dir/experiment_name/
+work_dir: "/data/pathology/projects/ivan/WSS/PBIP2/"
+
+# Data CSV path
+# Expected columns: image_name, wsi_label, attention_coordinates_path, attention_scores_path, annotation_path, split
+data_csv_path: "/data/pathology/projects/ivan/WSS/dummy_data.csv"
+
+# WSI Directory and Extension
+# NOTE: If your CSV contains a full absolute path in a column (mapped below as 'wsi_path'), 
+# that will be used instead of joining wsi_dir + image_name.
+wsi_dir: "/data/pa_cpgarchive/archives/skin/internal/images/derived/packed_p2/packed"
+wsi_extension: ".tif"
+
+# Column mapping configuration
+# Keys are the internal names used by code, Values are the column names in your CSV
+columns:
+  image_name: "image_name"
+  wsi_label: "wsi_label"
+  # Using attention_coordinates_path because it matches attention_scores
+  coordinates_path: "attention_coordinates_path" 
+  attention_scores_path: "attention_scores_path"
+  split: "split"
+  # New mapping for the column containing absolute paths to WSIs
+  wsi_path: "wsi_path"
+
+# Step 1: Prototype Extraction
+# prototype_thresholds: [pos_percentile, neg_percentile]
+# - binary mode: use class-1 scores for both classes
+#   - positive slides: select top pos_percentile of class-1 scores
+#   - negative slides: select top neg_percentile of class-1 scores (hard negatives)
+# - multiclass mode:
+#   - class > 0: select top pos_percentile of that class scores
+#   - class 0: select lowest neg_percentile of class-0 scores (hard negatives)
+prototype_thresholds: [0.005, 0.1]
+# Optional: Limit number of slides per class for faster iteration (remove or set to null for all slides)
+max_slides_per_class: 150
+# Optional: Cap patches per WSI after selection (remove or set to null for all patches)
+max_patches_per_slide: 100
+
+# Step 2: Clustering
+# Number of subclusters per class (K)
+n_clusters: 5
+# Number of prototypes per subcluster (Nk)
+n_prototypes_per_cluster: 6
+
+# Step 4: Training & Optimization
+train:
+  samples_per_gpu: 2
+  epoch: 50
+  contrastive_loss_weight: 0.5
+  infonce_temperature: 0.07
+  # Scaling for attention scores to 0-1 range for ClassNet supervision
+  # If true, performs min-max scaling per WSI
+  scale_attention: true
+  num_workers: 4
+
+optimizer:
+  type: AdamW
+  learning_rate: 0.00001
+  betas: [0.9, 0.999]
+  weight_decay: 0.003
+
+scheduler:
+  warmup_iter: 0
+  warmup_ratio: 1.0e-06
+  power: 1.0
+
+wandb:
+  project: PBIP-WSI-Segmentation
+  enabled: true
+
+# Step 5: Evaluation
+evaluation:
+  batch_size: 1

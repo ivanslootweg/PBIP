@@ -1,10 +1,11 @@
+import argparse
 import os
 import pickle as pkl
 import numpy as np
 import torch
+import yaml
 from sklearn.metrics.pairwise import cosine_similarity
-import matplotlib.pyplot as plt
-from PIL import Image
+import re
 
 class CosineSimilarityKMeans:
     def __init__(self, n_clusters, max_iter=100, random_state=None):
@@ -15,7 +16,12 @@ class CosineSimilarityKMeans:
         
     def fit_predict(self, X):
         n_samples = X.shape[0]
-        
+        if n_samples < self.n_clusters:
+            # If not enough samples, just use what we have as centers
+            self.cluster_centers_ = X
+            # Pad if strictly needed or return smaller
+            return np.arange(n_samples), np.eye(n_samples), torch.from_numpy(self.cluster_centers_)
+
         idx = np.random.choice(n_samples, self.n_clusters, replace=False)
         self.cluster_centers_ = X[idx]
         
@@ -28,87 +34,119 @@ class CosineSimilarityKMeans:
                 cluster_samples = X[new_labels == i]
                 if len(cluster_samples) > 0:
                     self.cluster_centers_[i] = cluster_samples.mean(axis=0)
-                    self.cluster_centers_[i] /= np.linalg.norm(self.cluster_centers_[i])
+                    self.cluster_centers_[i] /= (np.linalg.norm(self.cluster_centers_[i]) + 1e-8)
             
             if np.allclose(old_centers, self.cluster_centers_):
                 break
                 
         return new_labels, similarities, torch.from_numpy(self.cluster_centers_)
 
-def cluster_features_per_class(k_list):
-    with open("./features/image_features/bcss_features_pro.pkl", 'rb') as f:
-        features_dict = pkl.load(f)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Read from experiment-specific features dir
+    work_dir = config.get('work_dir', './work_dirs')
+    experiment_name = config.get('experiment_name', 'default_experiment')
+    features_dir = os.path.join(work_dir, experiment_name, 'features')
+    features_path = os.path.join(features_dir, 'prototype_features.pkl')
     
-    if len(k_list) != 4:
-        raise ValueError("k_list must contain 4 values for TUM, STR, LYM, and NEC respectively")
+    if not os.path.exists(features_path):
+        print(f"Features file not found at {features_path}. Please run extract_patches.py first.")
+        return
+
+    with open(features_path, 'rb') as f:
+        features_dict = pkl.load(f)
+        
+    n_clusters = config.get('n_clusters', 4)
+    n_proto_per_cluster = config.get('n_prototypes_per_cluster', 1)
+    
+    # K * Nk
+    target_k = n_clusters * n_proto_per_cluster
+    
+    class_names = config.get('class_names', ["Negative", "Positive"])
+    k_list = [target_k] * len(class_names)
     
     all_centers = []
-    class_order = ['TUM', 'STR', 'LYM', 'NEC']
-    
-    for class_name, k in zip(class_order, k_list):
-        print(f"\n{'='*20} Class: {class_name} (k={k}) {'='*20}")
+    prototype_metadata = {} 
+
+    for class_idx, class_name in enumerate(class_names):
+        print(f"Clustering {class_name} with K={target_k}...")
         
-        class_features = []
-        class_names = []
-        
-        for item in features_dict[class_name]:
-            class_features.append(item['features'].squeeze())
-            class_names.append(item['name'])
-        
-        features_array = np.array(class_features)
-        features_norm = features_array / np.linalg.norm(features_array, axis=1, keepdims=True)
-        
-        kmeans = CosineSimilarityKMeans(n_clusters=k, random_state=42)
-        cluster_labels, similarities, cluster_centers = kmeans.fit_predict(features_norm)
-        
-        all_centers.append(cluster_centers)
-        
-        for cluster_idx in range(k):
-            cluster_mask = cluster_labels == cluster_idx
-            cluster_similarities = similarities[cluster_mask][:, cluster_idx]
+        if class_name not in features_dict:
+            print(f"Warning: {class_name} not in features dict.")
+            dummy_protos = torch.randn(target_k, 512) 
+            all_centers.append(dummy_protos)
+            continue
             
-            top_5_indices = np.argsort(cluster_similarities)[-5:][::-1]
-            cluster_sample_indices = np.where(cluster_mask)[0][top_5_indices]
-            
-            print(f"\nCluster {cluster_idx + 1} - Top 5 closest images to center:")
-            for idx, sample_idx in enumerate(cluster_sample_indices, 1):
-                similarity = similarities[sample_idx, cluster_idx]
-                print(f"{idx}. {class_names[sample_idx]} (similarity: {similarity:.4f})")
-            
-            cluster_size = np.sum(cluster_labels == cluster_idx)
-            print(f"Total samples in cluster: {cluster_size}")
-    
+        items = features_dict[class_name]
+        if len(items) == 0:
+             print(f"Warning: No items for {class_name}.")
+             dummy_protos = torch.randn(target_k, 512) 
+             all_centers.append(dummy_protos)
+             continue
+             
+        feats = np.array([x['features'].squeeze() for x in items])
+        feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+        
+        kmeans = CosineSimilarityKMeans(n_clusters=target_k, random_state=42)
+        labels, sims, centers = kmeans.fit_predict(feats)
+        
+        all_centers.append(centers)
+        
+        class_protos = []
+        # Support case where we have fewer centers than target_k
+        actual_k = centers.shape[0]
+        
+        for c_id in range(actual_k):
+            # Best match for center c_id
+            col = sims[:, c_id]
+            best_idx = np.argmax(col)
+            item = items[best_idx]
+            name = item['name']
+            class_protos.append({
+                'name': name,
+                'cluster_idx': c_id,
+                'similarity': float(col[best_idx])
+            })
+        prototype_metadata[class_name] = class_protos
+
     all_centers_tensor = torch.cat(all_centers, dim=0)
+    
+    # Save to experiment specific dir
+    work_dir = config.get('work_dir', './work_dirs')
+    exp_name = config.get('experiment_name', 'default_exp')
+    exp_dir = os.path.join(work_dir, exp_name)
+    
+    save_dir = os.path.join(exp_dir, 'features')
+    os.makedirs(save_dir, exist_ok=True)
+    
+    save_path = os.path.join(save_dir, "prototypes.pkl")
+    viz_path = os.path.join(save_dir, "prototypes_viz.pkl")
+    
+    if os.path.exists(save_path) and os.path.exists(viz_path):
+        print(f"Prototypes already exist at {save_path}. Skipping clustering.")
+        return
     
     save_info = {
         'features': all_centers_tensor,
         'k_list': k_list,
-        'class_order': class_order,
-        'cumsum_k': np.cumsum([0] + k_list) 
+        'class_order': class_names, # Save class order for training mapping
+        'cumsum_k': np.cumsum([0] + k_list)
     }
-    
-    save_dir = "./features/image_features"
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"bcss_label_fea_pro_{k_list[0]}{k_list[1]}{k_list[2]}{k_list[3]}.pkl")
     
     with open(save_path, 'wb') as f:
         pkl.dump(save_info, f)
-    
-    print(f"\nInformation saved to {save_path}")
-    print(f"Feature tensor shape: {all_centers_tensor.shape}")
-    print(f"K list: {k_list}")
-    print(f"Cumulative sum of k: {save_info['cumsum_k']}")
-    print("Class features index ranges:")
-    for i, class_name in enumerate(class_order):
-        start_idx = save_info['cumsum_k'][i]
-        end_idx = save_info['cumsum_k'][i+1]
-        print(f"{class_name}: {start_idx} to {end_idx}")
+        
+    with open(viz_path, 'wb') as f:
+        pkl.dump(prototype_metadata, f)
+        
+    print(f"Saved prototypes to {save_path}")
+    print(f"Saved viz metadata to {viz_path}")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--k_list', type=int, nargs=4, default=[3,3,3,3],
-                      help='Number of clusters for each class [TUM, STR, LYM, NEC]')
-    args = parser.parse_args()
-    
-    cluster_features_per_class(k_list=args.k_list) 
+    main()
